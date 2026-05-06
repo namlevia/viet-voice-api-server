@@ -84,7 +84,7 @@ class FastVieNeuTTS(BaseVieneuTTS):
         self.backbone = pipeline(repo, backend_config=backend_config)
         self.gen_config = GenerationConfig(
             top_p=0.95, top_k=50, temperature=1.0, max_new_tokens=2048,
-            repetition_penalty=1.1,
+            repetition_penalty=1.2,
             do_sample=True, min_new_tokens=40,
         )
 
@@ -124,7 +124,7 @@ class FastVieNeuTTS(BaseVieneuTTS):
         return recon[0, 0, :]
 
 
-    def infer(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, torch.Tensor]] = None, ref_text: Optional[str] = None, max_chars: int = 256, silence_p: float = 0.15, crossfade_p: float = 0.0, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, apply_watermark: bool = True) -> np.ndarray:
+    def infer(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, torch.Tensor]] = None, ref_text: Optional[str] = None, max_chars: int = 256, silence_p: float = 0.15, crossfade_p: float = 0.0, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, apply_watermark: bool = True, **kwargs) -> np.ndarray:
 
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
 
@@ -139,20 +139,22 @@ class FastVieNeuTTS(BaseVieneuTTS):
             return np.array([], dtype=np.float32)
 
         if len(chunks) == 1:
-            prompt = self._format_prompt(ref_codes, ref_text, chunks[0], use_chat_format=self.use_chat_format)
+            prompt = self._format_prompt(ref_codes, ref_text, chunks[0], 
+                                        use_chat_format=self.use_chat_format,
+                                        emotion_tag=kwargs.get('emotion_tag'))
             responses = self.backbone([prompt], gen_config=self.gen_config, do_preprocess=False)
             wav = self._decode(responses[0].text)
             if apply_watermark:
                 wav = self._apply_watermark(wav)
         else:
-            all_wavs = self.infer_batch(chunks, ref_codes, ref_text, voice=voice, temperature=temperature, top_k=top_k, skip_normalize=True, apply_watermark=False)
+            all_wavs = self.infer_batch(chunks, ref_codes, ref_text, voice=voice, temperature=temperature, top_k=top_k, skip_normalize=True, apply_watermark=False, **kwargs)
             wav = join_audio_chunks(all_wavs, self.sample_rate, silence_p, crossfade_p)
             if apply_watermark:
                 wav = self._apply_watermark(wav)
 
         return wav
 
-    def infer_batch(self, texts: List[str], ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, torch.Tensor]] = None, ref_text: Optional[str] = None, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, apply_watermark: bool = True, max_batch_size: Optional[int] = None) -> List[np.ndarray]:
+    def infer_batch(self, texts: List[str], ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, torch.Tensor]] = None, ref_text: Optional[str] = None, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, apply_watermark: bool = True, max_batch_size: Optional[int] = None, **kwargs) -> List[np.ndarray]:
 
         if not skip_normalize:
             texts = [self.normalizer.normalize(t) for t in texts]
@@ -172,7 +174,9 @@ class FastVieNeuTTS(BaseVieneuTTS):
         for i in range(0, len(texts), max_batch_size):
             batch_texts = texts[i : i + max_batch_size]
             batch_phonemes = chunk_phonemes[i : i + max_batch_size]
-            prompts = [self._format_prompt(ref_codes, ref_text, text, ref_phonemes=ref_phonemes, input_phonemes=ph, use_chat_format=self.use_chat_format)
+            prompts = [self._format_prompt(ref_codes, ref_text, text, ref_phonemes=ref_phonemes, 
+                                          input_phonemes=ph, use_chat_format=self.use_chat_format,
+                                          emotion_tag=kwargs.get('emotion_tag'))
                       for text, ph in zip(batch_texts, batch_phonemes)]
             responses = self.backbone(prompts, gen_config=self.gen_config, do_preprocess=False)
             batch_codes = [response.text for response in responses]
@@ -182,7 +186,7 @@ class FastVieNeuTTS(BaseVieneuTTS):
             all_wavs.extend(batch_wavs)
         return all_wavs
 
-    def infer_stream(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, torch.Tensor]] = None, ref_text: Optional[str] = None, max_chars: int = 256, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False) -> Generator[np.ndarray, None, None]:
+    def infer_stream(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, torch.Tensor]] = None, ref_text: Optional[str] = None, max_chars: int = 256, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, **kwargs) -> Generator[np.ndarray, None, None]:
 
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
 
@@ -194,11 +198,11 @@ class FastVieNeuTTS(BaseVieneuTTS):
 
         chunks = split_text_into_chunks(text, max_chars=max_chars)
         for chunk in chunks:
-            yield from self._infer_stream_single(chunk, ref_codes, ref_text)
+            yield from self._infer_stream_single(chunk, ref_codes, ref_text, emotion_tag=kwargs.get('emotion_tag'))
 
-    def _infer_stream_single(self, text: str, ref_codes: Any, ref_text: str) -> Generator[np.ndarray, None, None]:
+    def _infer_stream_single(self, text: str, ref_codes: Any, ref_text: str, emotion_tag: Optional[str] = None) -> Generator[np.ndarray, None, None]:
         ref_codes_list = self.to_list(ref_codes)
-        prompt = self._format_prompt(ref_codes_list, ref_text, text, use_chat_format=self.use_chat_format)
+        prompt = self._format_prompt(ref_codes_list, ref_text, text, use_chat_format=self.use_chat_format, emotion_tag=emotion_tag)
         audio_cache = []
         token_cache = [f"<|speech_{idx}|>" for idx in ref_codes_list]
         n_decoded_samples = 0

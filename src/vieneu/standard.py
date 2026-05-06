@@ -104,7 +104,8 @@ class VieNeuTTS(BaseVieneuTTS):
                 repo_id=backbone_repo,
                 filename=gguf_filename or "*.gguf",
                 verbose=False,
-                n_gpu_layers=-1 if backbone_device in ("gpu", "cuda") else 0,
+                n_gpu_layers=-1,
+                repetitive_penalty=1.2,
                 n_ctx=self.max_context,
                 mlock=True,
                 flash_attn=True if backbone_device in ("gpu", "cuda") else False,
@@ -186,7 +187,7 @@ class VieNeuTTS(BaseVieneuTTS):
             logger.error(f"   ⚠️ Error during unload: {e}")
             return False
 
-    def infer(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes=None, ref_text: Optional[str] = None, max_chars: int = 256, silence_p: float = 0.15, crossfade_p: float = 0.0, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, apply_watermark: bool = True) -> np.ndarray:
+    def infer(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes=None, ref_text: Optional[str] = None, max_chars: int = 256, silence_p: float = 0.15, crossfade_p: float = 0.0, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, apply_watermark: bool = True, **kwargs) -> np.ndarray:
 
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
 
@@ -201,9 +202,9 @@ class VieNeuTTS(BaseVieneuTTS):
             ref_phonemes = self.get_ref_phonemes(ref_text)
             phonemes = phonemize_with_dict(chunks[0], skip_normalize=True)
             if self._is_quantized_model:
-                output_str = self._infer_ggml(ref_codes, ref_phonemes, phonemes, temperature, top_k)
+                output_str = self._infer_ggml(ref_codes, ref_phonemes, phonemes, temperature, top_k, emotion_tag=kwargs.get('emotion_tag'))
             else:
-                prompt_ids = self._apply_chat_template(ref_codes, ref_phonemes, phonemes)
+                prompt_ids = self._apply_chat_template(ref_codes, ref_phonemes, phonemes, emotion_tag=kwargs.get('emotion_tag'))
                 output_str = self._infer_torch(prompt_ids, temperature, top_k)
             wav = self._decode(output_str)
             if apply_watermark:
@@ -217,14 +218,15 @@ class VieNeuTTS(BaseVieneuTTS):
             temperature=temperature,
             top_k=top_k,
             skip_normalize=True,
-            apply_watermark=False
+            apply_watermark=False,
+            **kwargs
         )
         final_wav = join_audio_chunks(all_wavs, self.sample_rate, silence_p, crossfade_p)
         if apply_watermark:
             final_wav = self._apply_watermark(final_wav)
         return final_wav
 
-    def infer_batch(self, texts: List[str], ref_audio: Optional[Union[str, Path]] = None, ref_codes=None, ref_text: Optional[str] = None, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, apply_watermark: bool = True) -> List[np.ndarray]:
+    def infer_batch(self, texts: List[str], ref_audio: Optional[Union[str, Path]] = None, ref_codes=None, ref_text: Optional[str] = None, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, apply_watermark: bool = True, **kwargs) -> List[np.ndarray]:
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
 
         if not skip_normalize:
@@ -247,7 +249,7 @@ class VieNeuTTS(BaseVieneuTTS):
             import torch
             batch_prompt_ids = []
             for phonemes in chunk_phonemes:
-                prompt_ids = self._apply_chat_template(ref_codes, ref_phonemes, phonemes)
+                prompt_ids = self._apply_chat_template(ref_codes, ref_phonemes, phonemes, emotion_tag=kwargs.get('emotion_tag'))
                 batch_prompt_ids.append(torch.tensor(prompt_ids))
 
             inputs = self.tokenizer.pad(
@@ -282,7 +284,7 @@ class VieNeuTTS(BaseVieneuTTS):
 
         return all_wavs
 
-    def infer_stream(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes=None, ref_text: Optional[str] = None, max_chars: int = 256, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False) -> Generator[np.ndarray, None, None]:
+    def infer_stream(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes=None, ref_text: Optional[str] = None, max_chars: int = 256, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, **kwargs) -> Generator[np.ndarray, None, None]:
 
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
 
@@ -299,14 +301,14 @@ class VieNeuTTS(BaseVieneuTTS):
 
         for phonemes in chunk_phonemes:
             if self._is_quantized_model:
-                yield from self._infer_stream_ggml(ref_codes, ref_phonemes, phonemes, temperature, top_k)
+                yield from self._infer_stream_ggml(ref_codes, ref_phonemes, phonemes, temperature, top_k, emotion_tag=kwargs.get('emotion_tag'))
             else:
-                prompt_ids = self._apply_chat_template(ref_codes, ref_phonemes, phonemes)
+                prompt_ids = self._apply_chat_template(ref_codes, ref_phonemes, phonemes, emotion_tag=kwargs.get('emotion_tag'))
                 output_str = self._infer_torch(prompt_ids, temperature, top_k)
                 wav = self._decode(output_str)
                 yield self._apply_watermark(wav)
 
-    def _apply_chat_template(self, ref_codes: Any, ref_phonemes: str, chunk_phonemes: str) -> List[int]:
+    def _apply_chat_template(self, ref_codes: Any, ref_phonemes: str, chunk_phonemes: str, emotion_tag: Optional[str] = None) -> List[int]:
         ref_codes_list = self.to_list(ref_codes)
         full_phonemes = f"{ref_phonemes} {chunk_phonemes}"
 
@@ -328,10 +330,10 @@ class VieNeuTTS(BaseVieneuTTS):
             text_replace_idx = ids.index(text_replace)
             ids = ids[:text_replace_idx] + [text_prompt_start] + input_ids + [text_prompt_end] + ids[text_replace_idx + 1:]
 
-            speech_replace_idx = ids.index(speech_replace)
             ids = ids[:speech_replace_idx] + [speech_gen_start] + list(codes)
         else:
-            ids = [text_prompt_start] + input_ids + [text_prompt_end, speech_gen_start] + list(codes)
+            emotion_prefix_ids = self.tokenizer.encode(emotion_tag, add_special_tokens=False) if emotion_tag else []
+            ids = [text_prompt_start] + emotion_prefix_ids + input_ids + [text_prompt_end, speech_gen_start] + list(codes)
 
         return ids
 
@@ -354,34 +356,35 @@ class VieNeuTTS(BaseVieneuTTS):
         output_str = self.tokenizer.decode(output_tokens[0, input_length:].cpu().numpy().tolist(), add_special_tokens=False)
         return output_str
 
-    def _infer_ggml(self, ref_codes: Any, ref_phonemes: str, chunk_phonemes: str, temperature: float = 1.0, top_k: int = 50) -> str:
+    def _infer_ggml(self, ref_codes: Any, ref_phonemes: str, chunk_phonemes: str, temperature: float = 1.0, top_k: int = 50, emotion_tag: Optional[str] = None) -> str:
         ref_codes_list = self.to_list(ref_codes)
         codes_str = "".join([f"<|speech_{idx}|>" for idx in ref_codes_list])
+        emotion_prefix = emotion_tag if emotion_tag else ""
         if self.use_chat_format:
             prompt = (
-                f"user: Convert the text to speech:<|TEXT_PROMPT_START|>{ref_phonemes} {chunk_phonemes}"
+                f"user: Convert the text to speech:<|TEXT_PROMPT_START|>{emotion_prefix}{ref_phonemes} {chunk_phonemes}"
                 f"<|TEXT_PROMPT_END|>\nassistant:<|SPEECH_GENERATION_START|>{codes_str}"
             )
         else:
             prompt = (
-                f"<|TEXT_PROMPT_START|>{ref_phonemes} {chunk_phonemes}"
+                f"<|TEXT_PROMPT_START|>{emotion_prefix}{ref_phonemes} {chunk_phonemes}"
                 f"<|TEXT_PROMPT_END|><|SPEECH_GENERATION_START|>{codes_str}"
             )
         output = self.backbone(prompt, max_tokens=self.max_context, temperature=temperature, top_k=top_k, stop=["<|SPEECH_GENERATION_END|>"])
         return output["choices"][0]["text"]
 
-    def _infer_stream_ggml(self, ref_codes: Any, ref_phonemes: str, chunk_phonemes: str, temperature: float = 1.0, top_k: int = 50) -> Generator[np.ndarray, None, None]:
-
+    def _infer_stream_ggml(self, ref_codes: Any, ref_phonemes: str, chunk_phonemes: str, temperature: float = 1.0, top_k: int = 50, emotion_tag: Optional[str] = None) -> Generator[np.ndarray, None, None]:
         ref_codes_list = self.to_list(ref_codes)
         codes_str = "".join([f"<|speech_{idx}|>" for idx in ref_codes_list])
+        emotion_prefix = emotion_tag if emotion_tag else ""
         if self.use_chat_format:
             prompt = (
-                f"user: Convert the text to speech:<|TEXT_PROMPT_START|>{ref_phonemes} {chunk_phonemes}"
+                f"user: Convert the text to speech:<|TEXT_PROMPT_START|>{emotion_prefix}{ref_phonemes} {chunk_phonemes}"
                 f"<|TEXT_PROMPT_END|>\nassistant:<|SPEECH_GENERATION_START|>{codes_str}"
             )
         else:
             prompt = (
-                f"<|TEXT_PROMPT_START|>{ref_phonemes} {chunk_phonemes}"
+                f"<|TEXT_PROMPT_START|>{emotion_prefix}{ref_phonemes} {chunk_phonemes}"
                 f"<|TEXT_PROMPT_END|><|SPEECH_GENERATION_START|>{codes_str}"
             )
 

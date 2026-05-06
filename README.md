@@ -9,18 +9,21 @@
 
 <img width="1087" height="710" alt="image" src="https://github.com/user-attachments/assets/5534b5db-f30b-4d27-8a35-80f1cf6e5d4d" />
 
-**VieNeu-TTS** is an advanced on-device Vietnamese Text-to-Speech (TTS) model with **instant voice cloning** and **English-Vietnamese bilingual** support.
+**VieNeu-TTS-v2** is the next generation of on-device Vietnamese TTS, featuring **10,000+ hours** of bilingual training, **instant voice cloning**, and a dedicated **Podcast/Conversation** mode.
 
 > [!IMPORTANT]
-> **🚀 VieNeu-TTS-v2 Turbo:** Optimized for edge devices and extremely fast inference (CPU & Low-end devices).  
-> *Note: Quality is lower than the Standard VieNeu-TTS and may struggle with very short segments (< 5 words).*  
-> Version **VieNeu-TTS-v2 (Non-Turbo)** is coming soon!
+> **🚀 VieNeu-TTS-v2 is here!**
+> The full high-fidelity bilingual architecture is now available with:
+> - **10,000+ Hours of Data:** Unmatched naturalness in both English and Vietnamese.
+> - **Podcast & Dialogue Mode:** Multi-speaker support with emotional nuances.
+> - **Zero-shot Cloning:** Clone any voice in 3-5 seconds across all v2 variants.
 
 ## ✨ Key Features
-- **Bilingual (English-Vietnamese)**: Smooth and natural transitions between languages powered by [sea-g2p](https://github.com/pnnbao97/sea-g2p).
-- **Instant Voice Cloning**: Clone any voice with just **3-5 seconds** of reference audio (**Turbo v2** & GPU modes).
-- **Ultra-Fast Turbo Mode**: Optimized for both **CPU (GGUF)** and **GPU (LMDeploy)**, offering the fastest inference in the VieNeu family.
-- **AI Identification**: Built-in audio watermarking for responsible AI content creation.
+- **10,000+ Hours Training**: Trained on a massive English-Vietnamese dataset for human-like prosody.
+- **Bilingual (En-Vi) Code-switching**: Seamless transitions between languages.
+- **Podcast & Conversation Mode**: Multi-speaker dialogue support with automatic character detection.
+- **Instant Voice Cloning**: Clone any voice with just **3-5 seconds** of reference audio.
+- **Ultra-Fast Performance**: Optimized for **GPU (LMDeploy)** and **CPU (GGUF/ONNX)**.
 - **Production-Ready**: High-quality 24 kHz waveform generation, fully offline.
 
 [<img width="600" height="595" alt="VieNeu-TTS Demo" src="https://github.com/user-attachments/assets/021f6671-2d7f-4635-91fb-88b2ab0ddbcd" />](https://github.com/user-attachments/assets/021f6671-2d7f-4635-91fb-88b2ab0ddbcd)
@@ -61,8 +64,8 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
      ```bash
      uv sync
      ```
-   - **Option 2: Full (GPU/Standard)** - High Quality & Cloning *(For GPU users)*
-     > 💡 *Note: Requires a CUDA-compatible NVIDIA GPU (CUDA version >= 12.8) or Apple Silicon MPS. [NVIDIA Toolkit](https://developer.nvidia.com/cuda-downloads) is required for maximum speed. Enables the full **Standard VieNeu-TTS** backbone for maximum audio quality and high-fidelity voice cloning.*
+   - **Option 2: Full (GPU/Standard)** - High Quality & Podcast Mode *(For GPU users)*
+     > 💡 *Note: Requires a CUDA-compatible NVIDIA GPU. Enables the full **VieNeu-TTS-v2** backbone for maximum audio quality and multi-speaker conversation support.*
      ```bash
      uv sync --group gpu
      ```
@@ -252,12 +255,12 @@ docker run --gpus all \
 
 ## 🔬 4. Model Overview <a name="backbones"></a>
 
-| Model | Format | Device | Bilingual | Cloning | Speed |
+| Model | Format | Device | Bilingual | Features | Speed |
 |---|---|---|---|---|---|
-| **VieNeu-v2-Turbo** | GGUF/ONNX | **CPU/Edge** | ✅ | ✅ Yes | **Extreme** (Fastest) |
-| **VieNeu-TTS-v2** | PyTorch | GPU | ✅ | ✅ Yes | **Standard** (Coming soon) |
-| **VieNeu-TTS 0.3B** | PyTorch | GPU/CPU | ❌ | ✅ Yes | **Very Fast** |
-| **VieNeu-TTS** | PyTorch | GPU/CPU | ❌ | ✅ Yes | **Standard** |
+| **VieNeu-TTS-v2** | PyTorch | **GPU** | ✅ | **Podcast, En-Vi CS** | **Fast (LMDeploy)** |
+| **VieNeu-v2-CPU** | GGUF/ONNX | **CPU/Edge** | ✅ | **Podcast, En-Vi CS** | **Extreme Speed** |
+| **VieNeu-v2-Turbo** | GGUF/ONNX | **CPU/Edge** | ✅ | Lightweight En-Vi | **Ultra Fast** |
+| **VieNeu-TTS (v1)** | PyTorch | GPU/CPU | ❌ | Stable (Vi only) | Standard |
 
 > [!TIP]
 > Use **Turbo v2** for AI assistants, chatbots, and real-time edge applications where speed is critical. Note: It may have stability issues with very short phrases (< 5 words).
@@ -267,9 +270,8 @@ docker run --gpus all \
 
 ## 🚀 5. Roadmap <a name="roadmap"></a>
 
-- [x] **VieNeu-TTS-v2 Turbo**: English-Vietnamese code-switching support.
+- [x] **VieNeu-TTS-v2**: Full high-fidelity bilingual architecture with **Podcast Mode** and **Voice Cloning**.
 - [x] **VieNeu-Codec**: Optimized neural codec for Vietnamese (ONNX).
-- [ ] **VieNeu-TTS-v2 (Non-Turbo)**: Full high-fidelity bilingual architecture with instant **Voice Cloning** and **LMDeploy** GPU acceleration support.
 - [x] **Turbo Voice Cloning**: Bringing instant cloning to the lightweight Turbo engine.
 - [ ] **Mobile SDK**: Official support for Android/iOS deployment.
 
@@ -287,7 +289,7 @@ docker run --gpus all \
 
 ```bibtex
 @misc{vieneutts2026,
-  title        = {VieNeu-TTS: Vietnamese Text-to-Speech with Instant Voice Cloning},
+  title        = {VieNeu-TTS-v2: Advanced Vietnamese Text-to-Speech with Podcast and Code-Switching Support},
   author       = {Pham Nguyen Ngoc Bao},
   year         = {2026},
   publisher    = {Hugging Face},

@@ -383,7 +383,8 @@ class BaseVieneuTTS(ABC):
         input_text: str,
         ref_phonemes: Optional[str] = None,
         input_phonemes: Optional[str] = None,
-        use_chat_format: bool = False
+        use_chat_format: bool = False,
+        emotion_tag: Optional[str] = None
     ) -> str:
         """
         Format the prompt for the TTS model.
@@ -405,13 +406,15 @@ class BaseVieneuTTS(ABC):
         input_text_phones = input_phonemes if input_phonemes else phonemize_with_dict(input_text, skip_normalize=True)
         codes_str = "".join([f"<|speech_{idx}|>" for idx in ref_codes_list])
 
+        emotion_prefix = emotion_tag if emotion_tag else ""
+
         if use_chat_format:
             return (
-                f"user: Convert the text to speech:<|TEXT_PROMPT_START|>{ref_text_phones} {input_text_phones}"
+                f"user: Convert the text to speech:<|TEXT_PROMPT_START|>{emotion_prefix}{ref_text_phones} {input_text_phones}"
                 f"<|TEXT_PROMPT_END|>\nassistant:<|SPEECH_GENERATION_START|>{codes_str}"
             )
         return (
-            f"<|TEXT_PROMPT_START|>{ref_text_phones} {input_text_phones}"
+            f"<|TEXT_PROMPT_START|>{emotion_prefix}{ref_text_phones} {input_text_phones}"
             f"<|TEXT_PROMPT_END|><|SPEECH_GENERATION_START|>{codes_str}"
         )
 

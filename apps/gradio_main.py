@@ -10,6 +10,7 @@ import numpy as np
 import queue
 import threading
 import yaml
+import uuid
 from vieneu_utils.core_utils import split_text_into_chunks, join_audio_chunks, env_bool, split_into_chunks_v2, get_silence_duration_v2
 from vieneu_utils.phonemize_text import phonemize_with_dict
 from sea_g2p import Normalizer
@@ -37,38 +38,33 @@ except ImportError:
 
 filtered_backbones = {}
 if HAS_GPU:
+    filtered_backbones["VieNeu-TTS-v2 (GPU)"] = {
+        "repo": "pnnbao-ump/VieNeu-TTS-v2",
+        "supports_streaming": False,
+        "description": "VieNeu-TTS Version 2 - hỗ trợ song ngữ (Anh-Việt) và chế độ podcast"
+    }
     filtered_backbones["VieNeu-TTS (GPU)"] = {
         "repo": "pnnbao-ump/VieNeu-TTS",
         "supports_streaming": False,
-        "description": "⭐ Chất lượng cao nhất, yêu cầu GPU"
-    }
-    filtered_backbones["VieNeu-TTS-0.3B (GPU)"] = {
-        "repo": "pnnbao-ump/VieNeu-TTS-0.3B",
-        "supports_streaming": False,
-        "description": "⚡ Bản 0.3B tối ưu cho GPU, rất nhanh"
+        "description": "VieNeu-TTS Version 1 - ổn định, production-ready"
     }
     filtered_backbones["VieNeu-TTS-0.3B-ngoc-huyen (GPU)"] = {
         "repo": "pnnbao-ump/VieNeu-TTS-0.3B-ngoc-huyen",
         "supports_streaming": False,
-        "description": "✨ Voice: Ngọc Huyền - 0.3B"
+        "description": "VieNeu-TTS-0.3B - Ngọc Huyền"
     }
-    filtered_backbones["VieNeu-TTS-v2-Turbo (GPU)"] = {
-        "repo": "pnnbao-ump/VieNeu-TTS-v2-Turbo",
-        "supports_streaming": False,
-        "description": "🚀 Turbo v2 (GPU): Hỗ trợ bilingual (Anh-Việt), tối ưu cho GPU"
-    }
+
+filtered_backbones["VieNeu-TTS-v2 (CPU)"] = {
+    "repo": "pnnbao-ump/VieNeu-TTS-v2",
+    "gguf_filename": "VieNeu-TTS-v2-Q4-K-M.gguf",
+    "supports_streaming": False,
+    "description": "VieNeu-TTS-v2 (CPU) - GGUF Q4_K_M, hỗ trợ song ngữ & podcast"
+}
 
 filtered_backbones["VieNeu-TTS-v2-Turbo (CPU)"] = {
     "repo": "pnnbao-ump/VieNeu-TTS-v2-Turbo-GGUF",
     "supports_streaming": True,
-    "description": "🚀 Turbo v2: Siêu nhanh, tối ưu tuyệt đối cho CPU & Thiết bị yếu"
-}
-
-filtered_backbones["VieNeu-TTS-0.3B (CPU)"] = {
-    "repo": "pnnbao-ump/VieNeu-TTS-0.3B",
-    "gguf_filename": "VieNeu-TTS-0.3B-Q4_K_M.gguf",
-    "supports_streaming": True,
-    "description": "⚡ 0.3B GGUF: Nhẹ, chạy tốt trên CPU"
+    "description": "VieNeu-TTS-v2-Turbo - Siêu nhanh, tối ưu tuyệt đối cho CPU & Thiết bị yếu"
 }
 
 BACKBONE_CONFIGS = filtered_backbones
@@ -106,9 +102,17 @@ current_backbone = None
 current_codec = None
 model_loaded = False
 using_lmdeploy = False
+PRESET_VOICES_CACHE = []  # List of all voices (tuples or strings)
+CONV_VOICES_CACHE = []    # Filtered list for conversation (podcast=True)
+MAX_SPEAKERS = 8          # Max concurrent speakers in conversation tab
 
 # Normalizer (module-level singleton)
 _text_normalizer = Normalizer()
+
+# --- CANCELLATION ---
+# threading.Event is a mutable object: never reassigned, always the same reference.
+# All threads share the exact same object — no scoping/serialization issues.
+_STOP_EVENT = threading.Event()
 
 # Cache for reference texts
 _ref_text_cache = {}
@@ -184,6 +188,7 @@ def restore_ui_state():
     return (
         msg, 
         gr.update(interactive=model_loaded), # btn_generate
+        gr.update(interactive=model_loaded), # btn_generate_conv
         gr.update(interactive=False)         # btn_stop
     )
 
@@ -233,13 +238,19 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
     lmdeploy_error_reason = None
     model_loaded = False # Ensure we don't try to use a half-loaded model
     
+    # Helper for slot updates (initially no change)
+    slot_no_updates = [gr.update()] * MAX_SPEAKERS
+
     yield (
         "⏳ Đang tải model với tối ưu hóa... Lưu ý: Quá trình này sẽ tốn thời gian. Vui lòng kiên nhẫn.",
-        gr.update(interactive=False),
-        gr.update(interactive=False),
-        gr.update(interactive=False),
-        gr.update(),
-        gr.update(), gr.update(), gr.update(), gr.update()
+        gr.update(interactive=False), # btn_generate
+        gr.update(interactive=False), # btn_generate_conv
+        gr.update(interactive=False), # btn_load
+        gr.update(interactive=False), # btn_stop
+        gr.update(), # voice_select
+        gr.update(), gr.update(), gr.update(), gr.update(), # tab_p, tab_c, tab_sel, mode_state
+        gr.update(), # conv_tab
+        *slot_no_updates
     )
     
     try:
@@ -257,8 +268,10 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
             if not custom_model_id or not custom_model_id.strip():
                 yield (
                     "❌ Lỗi: Vui lòng nhập Model ID cho Custom Model.",
-                    gr.update(interactive=False), gr.update(interactive=True), gr.update(interactive=False), gr.update(),
-                    gr.update(), gr.update(), gr.update(), gr.update()
+                    gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=True), gr.update(interactive=False), gr.update(),
+                    gr.update(), gr.update(), gr.update(), gr.update(),
+                    gr.update(), # conv_tab
+                    *slot_no_updates
                 )
                 return
 
@@ -269,8 +282,10 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
                 if custom_base_model not in BACKBONE_CONFIGS:
                     yield (
                         f"❌ Lỗi: Base Model '{custom_base_model}' không hợp lệ.",
-                        gr.update(interactive=False), gr.update(interactive=True), gr.update(interactive=False),
-                        gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+                        gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=True), gr.update(interactive=False),
+                        gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
+                        gr.update(), # conv_tab
+                        *slot_no_updates
                     )
                     return
                 
@@ -353,8 +368,11 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
                          gr.update(interactive=False),
                          gr.update(interactive=False),
                          gr.update(interactive=False),
+                         gr.update(interactive=False),
                          gr.update(),
-                         gr.update(), gr.update(), gr.update(), gr.update()
+                         gr.update(), gr.update(), gr.update(), gr.update(),
+                         gr.update(), # conv_tab
+                         *slot_no_updates
                     )
                     
                     try:
@@ -454,8 +472,11 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
                     gr.update(interactive=False),
                     gr.update(interactive=False),
                     gr.update(interactive=False),
+                    gr.update(interactive=False),
                     gr.update(),
-                    gr.update(), gr.update(), gr.update(), gr.update()
+                    gr.update(), gr.update(), gr.update(), gr.update(),
+                    gr.update(), # conv_tab
+                    *slot_no_updates
                 )
                 time.sleep(1)
                 use_lmdeploy = False
@@ -549,8 +570,10 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
             if is_merged_lora and custom_loading and not using_lmdeploy:
                 yield (
                     f"🔄 Đang tải và merge LoRA adapter: {custom_model_id}...",
-                    gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False), gr.update(),
-                    gr.update(), gr.update(), gr.update(), gr.update()
+                    gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False), gr.update(),
+                    gr.update(), gr.update(), gr.update(), gr.update(),
+                    gr.update(), # conv_tab
+                    *slot_no_updates
                 )
                 try:
                     # 1. Load Adapter
@@ -643,6 +666,21 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
 
             voice_update = gr.update(choices=voices, value=default_v, interactive=True)
             
+            global PRESET_VOICES_CACHE, CONV_VOICES_CACHE
+            PRESET_VOICES_CACHE = voices
+            
+            # Filter voices for conversation tab (podcast=True)
+            # Handle both boolean True/False and string "True"/"False"
+            def _check_podcast(v_id):
+                val = tts._preset_voices.get(v_id, {}).get('podcast', True)
+                if isinstance(val, str):
+                    return val.strip().lower() == "true"
+                return bool(val)
+
+            CONV_VOICES_CACHE = [v for v in voices if _check_podcast(v[1])]
+            
+            slot_dd_update = gr.update(choices=CONV_VOICES_CACHE)
+            
             # Show Standard Tabs
             tab_p = gr.update(visible=True)
             tab_c = gr.update(visible=True)
@@ -652,6 +690,7 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
             # Missing voices.json case
             msg = "⚠️ Không tìm thấy file voices.json. Vui lòng dùng Tab Voice Cloning."
             voice_update = gr.update(choices=[msg], value=msg, interactive=False)
+            slot_dd_update = gr.update(choices=[])
             
             # Show Preset Tab (to see message) and Custom Tab
             tab_p = gr.update(visible=True)
@@ -659,13 +698,23 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
             tab_sel = gr.update(selected="preset_mode")
             mode_state = "preset_mode"
 
+        # Check if v2 for conversation tab
+        is_v2 = (backbone_choice == "VieNeu-TTS-v2 (GPU)" or backbone_choice == "VieNeu-TTS-v2 (CPU)")
+        conv_tab_update = gr.update(visible=is_v2)
+
+        # Update all MAX_SPEAKERS slot dropdowns
+        slot_updates = [slot_dd_update] * MAX_SPEAKERS
+
         yield (
             success_msg,
             gr.update(interactive=True), # btn_generate
+            gr.update(interactive=True), # btn_generate_conv
             gr.update(interactive=True), # btn_load
             gr.update(interactive=False), # btn_stop
             voice_update,
-            tab_p, tab_c, tab_sel, mode_state
+            tab_p, tab_c, tab_sel, mode_state,
+            conv_tab_update,
+            *slot_updates
         )
         
     except Exception as e:
@@ -678,19 +727,25 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
             yield (
                 "❌ Lỗi khi tải model: Không tìm thấy biến môi trường CUDA_PATH. Vui lòng cài đặt NVIDIA GPU Computing Toolkit (https://developer.nvidia.com/cuda/toolkit)",
                 gr.update(interactive=False),
-                gr.update(interactive=True),
-                gr.update(interactive=False),
-                gr.update(),
-                gr.update(), gr.update(), gr.update(), gr.update()
+                gr.update(interactive=False), # btn_generate_conv
+                gr.update(interactive=True), # btn_load
+                gr.update(interactive=False), # btn_stop
+                gr.update(), # voice_select
+                gr.update(), gr.update(), gr.update(), gr.update(),
+                gr.update(), # conv_tab
+                *slot_no_updates
             )
         else: 
             yield (
                 f"❌ Lỗi khi tải model: {str(e)}",
                 gr.update(interactive=False),
+                gr.update(interactive=False),
                 gr.update(interactive=True),
                 gr.update(interactive=False),
                 gr.update(),
-                gr.update(), gr.update(), gr.update(), gr.update()
+                gr.update(), gr.update(), gr.update(), gr.update(),
+                gr.update(), # conv_tab
+                *slot_no_updates
             )
 
 
@@ -698,9 +753,11 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
 
 def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: str, 
                       mode_tab: str, generation_mode: str, use_batch: bool, max_batch_size_run: int,
-                      temperature: float, max_chars_chunk: int):
+                      temperature: float, max_chars_chunk: int, session_id: str = None):
     """Synthesis with optimization support and max batch size control"""
     global tts, current_backbone, current_codec, model_loaded, using_lmdeploy
+    
+    _STOP_EVENT.clear()  # Reset for new generation
     
     if not model_loaded or tts is None:
         yield None, "⚠️ Vui lòng tải model trước!"
@@ -790,6 +847,9 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
                 # Sequential processing with progress updates
                 total_chunks = len(text_chunks)
                 for i, chunk in enumerate(text_chunks):
+                    if _STOP_EVENT.is_set():
+                        yield None, "⏹️ Đã dừng tạo giọng nói."
+                        return
                     yield None, f"⚡ Turbo v2: Đang xử lý đoạn {i+1}/{total_chunks}..."
                     
                     chunk_wav = tts.infer(
@@ -811,24 +871,37 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
             
             # Use batch processing if enabled and using LMDeploy (for v1)
             elif use_batch and using_lmdeploy and hasattr(tts, 'infer_batch') and total_chunks > 1:
+                # Process in mini-batches to allow cancellation between batches
                 num_batches = (total_chunks + max_batch_size_run - 1) // max_batch_size_run
-                yield None, f"⚡ Xử lý {num_batches} mini-batch(es) (max {max_batch_size_run} đoạn/batch)..."
                 
-                chunk_wavs = tts.infer_batch(
-                    text_chunks, 
-                    ref_codes=ref_codes, 
-                    ref_text=ref_text_raw,
-                    max_batch_size=max_batch_size_run,
-                    temperature=temperature,
-                    skip_normalize=True
-                )
-                for chunk_wav in chunk_wavs:
-                    if chunk_wav is not None and len(chunk_wav) > 0:
-                        all_wavs.append(chunk_wav)
+                for i in range(0, total_chunks, max_batch_size_run):
+                    if _STOP_EVENT.is_set():
+                        print("🛑 Synthesis stopped during batch processing.")
+                        yield None, "⏹️ Đã dừng tạo giọng nói."
+                        return
+                    
+                    batch_idx = i // max_batch_size_run
+                    yield None, f"⚡ Đang xử lý batch {batch_idx+1}/{num_batches} (đoạn {i+1}-{min(i+max_batch_size_run, total_chunks)})..."
+                    
+                    current_batch = text_chunks[i : i + max_batch_size_run]
+                    batch_wavs = tts.infer_batch(
+                        current_batch, 
+                        ref_codes=ref_codes, 
+                        ref_text=ref_text_raw,
+                        max_batch_size=max_batch_size_run,
+                        temperature=temperature,
+                        skip_normalize=True
+                    )
+                    for chunk_wav in batch_wavs:
+                        if chunk_wav is not None and len(chunk_wav) > 0:
+                            all_wavs.append(chunk_wav)
 
             else:
                 # Sequential processing (PyTorch or GGUF v1)
                 for i, chunk in enumerate(text_chunks):
+                    if _STOP_EVENT.is_set():
+                        yield None, "⏹️ Đã dừng tạo giọng nói."
+                        return
                     yield None, f"⏳ Đang xử lý đoạn {i+1}/{total_chunks}..."
                     chunk_wav = tts.infer(
                         chunk, 
@@ -914,6 +987,9 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
                 previous_tail = None
                 
                 for i, chunk_text in enumerate(text_chunks):
+                    if _STOP_EVENT.is_set():
+                        break
+                    
                     if is_v2_turbo:
                         stream_gen = tts.infer_stream(
                             chunk_text, 
@@ -921,7 +997,8 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
                             temperature=temperature,
                             max_chars=max_chars_chunk,
                             skip_normalize=True,
-                            skip_phonemize=True
+                            skip_phonemize=True,
+                            emotion_tag=""
                         )
                     else:
                         stream_gen = tts.infer_stream(
@@ -930,10 +1007,13 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
                             ref_text=ref_text_raw,
                             temperature=temperature,
                             max_chars=max_chars_chunk,
-                            skip_normalize=True
+                            skip_normalize=True,
+                            emotion_tag=""
                         )
                     
                     for part_idx, audio_part in enumerate(stream_gen):
+                        if _STOP_EVENT.is_set():
+                            break
                         if audio_part is None or len(audio_part) == 0:
                             continue
                         
@@ -1034,6 +1114,250 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
                 tts.cleanup_memory()
             
             cleanup_gpu_memory()
+
+
+# --- 3. CONVERSATION LOGIC ---
+
+def synthesize_conversation(
+    script_text: str,
+    *args
+):
+    """
+    Synthesizes multi-speaker conversation from a script.
+
+    Gradio passes speaker name boxes and voice dropdowns as individual positional args.
+    Layout: args[0..MAX_SPEAKERS-1] = speaker names, args[MAX_SPEAKERS..2*MAX_SPEAKERS-1] = voice IDs,
+    args[2*MAX_SPEAKERS] = silence_duration, args[2*MAX_SPEAKERS+1] = temperature,
+    args[2*MAX_SPEAKERS+2] = max_chars_chunk, args[2*MAX_SPEAKERS+3] = session_id
+    """
+    speaker_names     = list(args[:MAX_SPEAKERS])
+    speaker_voices    = list(args[MAX_SPEAKERS:MAX_SPEAKERS*2])
+    silence_duration  = args[MAX_SPEAKERS * 2]
+    temperature       = args[MAX_SPEAKERS * 2 + 1]
+    max_chars_chunk   = args[MAX_SPEAKERS * 2 + 2]
+    session_id        = args[MAX_SPEAKERS * 2 + 3] if len(args) > MAX_SPEAKERS * 2 + 3 else None
+
+    global tts, model_loaded, using_lmdeploy
+    
+    _STOP_EVENT.clear()
+    
+    if not model_loaded or tts is None:
+        yield None, "⚠️ Vui lòng tải model trước!"
+        return
+        
+    if not script_text or script_text.strip() == "":
+        yield None, "⚠️ Vui lòng nhập kịch bản hội thoại!"
+        return
+
+    # 1. Parse Script
+    lines = []
+    for line in script_text.strip().split('\n'):
+        if not line.strip(): continue
+        if ':' in line:
+            parts = line.split(':', 1)
+            lines.append({'speaker': parts[0].strip(), 'text': parts[1].strip()})
+        else:
+            if lines:
+                lines[-1]['text'] += " " + line.strip()
+            else:
+                lines.append({'speaker': 'Narrator', 'text': line.strip()})
+
+    if not lines:
+        yield None, "⚠️ Không tìm thấy lời thoại hợp lệ (định dạng Nhân vật: Lời thoại)!"
+        return
+
+    # 2. Build Speaker Mapping from individual slot components
+    mapping = {}
+    for name, voice in zip(speaker_names, speaker_voices):
+        name = str(name).strip() if name else ""
+        if not name: continue
+        # Use lowercase key for robust matching
+        mapping[name.lower()] = {
+            'type': 'Preset',
+            'voice': str(voice) if voice else "",
+            'ref_text': ''
+        }
+
+
+    # 3. Process Each Line
+    all_wavs = []
+    sr = 24000
+    total_lines = len(lines)
+    
+    yield None, f"🎭 Đang khởi tạo hội thoại ({total_lines} câu)..."
+    
+    start_time = time.time()
+    
+    try:
+        for i, line in enumerate(lines):
+            if _STOP_EVENT.is_set():
+                yield None, "⏹️ Đã dừng hội thoại."
+                return
+            spk_name = line['speaker']
+            text = line['text']
+            
+            yield None, f"⏳ [{i+1}/{total_lines}] {spk_name}: {text[:30]}..."
+            
+            # Determine voice
+            ref_codes = None
+            ref_text_val = None
+            current_voice_obj = None
+            
+            # Case-insensitive lookup
+            config = mapping.get(spk_name.lower())
+            
+            if not config:
+                print(f"  ⚠️ Character '{spk_name}' not found in mapping. Fallback to default.")
+                # Fallback to default if speaker not mapped
+                try:
+                    # Get default voice data
+                    default_v_id = tts._default_voice
+                    if not default_v_id:
+                        dv_list = tts.list_preset_voices()
+                        if dv_list:
+                            first = dv_list[0]
+                            default_v_id = first[1] if isinstance(first, tuple) else first
+                    
+                    if default_v_id:
+                        current_voice_obj = tts.get_preset_voice(default_v_id)
+                        ref_codes = current_voice_obj['codes']
+                        ref_text_val = current_voice_obj['text']
+                except Exception as e:
+                    print(f"  ❌ Fallback failed: {e}")
+            else:
+                try:
+                    v_id = config['voice']
+                    if config['type'] == "Preset":
+                        current_voice_obj = tts.get_preset_voice(v_id)
+                        if current_voice_obj and 'codes' in current_voice_obj:
+                            ref_codes = current_voice_obj['codes']
+                            ref_text_val = current_voice_obj['text']
+                        else:
+                            print(f"  ❌ Could not find codes for voice '{v_id}'")
+                    else: # Custom
+                        if v_id and os.path.exists(v_id):
+                            ref_codes = tts.encode_reference(v_id)
+                            ref_text_val = config.get('ref_text', '')
+                            current_voice_obj = {'codes': ref_codes, 'text': ref_text_val}
+                            print(f"  🦜 Using custom voice for '{spk_name}'")
+                except Exception as e:
+                    print(f"  ❌ Lỗi nạp giọng cho {spk_name} (ID: {config.get('voice')}): {e}")
+            
+            # Ensure numpy for inference
+            if 'torch' in sys.modules:
+                import torch
+                if isinstance(ref_codes, torch.Tensor):
+                    ref_codes = ref_codes.cpu().numpy()
+
+            # Infer audio
+            try:
+                wav = tts.infer(
+                    text,
+                    voice=current_voice_obj, # Use full voice object
+                    ref_codes=ref_codes,     # Fallback if object not supported
+                    ref_text=ref_text_val,
+                    temperature=temperature,
+                    max_chars=max_chars_chunk,
+                    emotion_tag="<|emotion_0|>" # Emotion tag for conversation
+                )
+                
+                all_wavs.append(wav)
+                
+                # Add silence between turns
+                if i < total_lines - 1 and silence_duration > 0:
+                    silence_len = int(sr * silence_duration)
+                    silence = np.zeros(silence_len)
+                    all_wavs.append(silence)
+                    
+            except Exception as e:
+                print(f"❌ Lỗi tổng hợp câu {i+1}: {e}")
+                continue
+
+        if not all_wavs:
+            yield None, "❌ Không thể tạo được âm thanh nào!"
+            return
+
+        # 4. Merge and Output
+        yield None, "🪄 Đang ghép nối âm thanh..."
+        final_wav = np.concatenate(all_wavs)
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            sf.write(tmp.name, final_wav, sr)
+            elapsed = time.time() - start_time
+            yield tmp.name, f"✅ Hoàn tất hội thoại! ({total_lines} câu, xử lý trong {elapsed:.1f}s)"
+            
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        yield None, f"❌ Lỗi hệ thống: {str(e)}"
+
+def extract_speakers_from_script(script):
+    """Find unique speakers and return gr.update() lists for the 8 slot components."""
+    global CONV_VOICES_CACHE
+    if not script:
+        # Hide all slots
+        name_updates = [gr.update(value="", visible=False)] * MAX_SPEAKERS
+        dd_updates   = [gr.update(value=None, visible=False)] * MAX_SPEAKERS
+        row_updates  = [gr.update(visible=False)] * MAX_SPEAKERS
+        return name_updates + dd_updates + row_updates
+
+    speakers = []
+    seen = set()
+    for line in script.strip().split('\n'):
+        if ':' in line:
+            s = line.split(':', 1)[0].strip()
+            if s and s not in seen:
+                seen.add(s)
+                speakers.append(s)
+
+    # Auto-match each speaker name to a preset voice
+    def _best_match(name):
+        if not CONV_VOICES_CACHE:
+            return None
+        
+        name_l = name.lower()
+        
+        # 0. Manual overrides for specific common names
+        overrides = {
+            "phương": "Trúc Ly",
+            "dũng": "Thanh Bình",
+            "hùng": "Thái Sơn"
+        }
+        if name_l in overrides:
+            target = overrides[name_l].lower()
+            for v in CONV_VOICES_CACHE:
+                label, value = (v[0], v[1]) if isinstance(v, tuple) else (v, v)
+                if target in label.lower() or target in value.lower():
+                    return value
+
+        # 1. Try to find name in labels or values
+        for v in CONV_VOICES_CACHE:
+            label, value = (v[0], v[1]) if isinstance(v, tuple) else (v, v)
+            if name_l == label.lower() or name_l == value.lower():
+                return value
+        
+        # 2. Fuzzy match (contains)
+        for v in CONV_VOICES_CACHE:
+            label, value = (v[0], v[1]) if isinstance(v, tuple) else (v, v)
+            if name_l in label.lower() or name_l in value.lower() or label.lower() in name_l or value.lower() in name_l:
+                return value
+        
+        # 3. Default to first voice if no match
+        first_voice = CONV_VOICES_CACHE[0]
+        return first_voice[1] if isinstance(first_voice, tuple) else first_voice
+
+    name_updates, dd_updates, row_updates = [], [], []
+    for i in range(MAX_SPEAKERS):
+        if i < len(speakers):
+            name_updates.append(gr.update(value=speakers[i], visible=True))
+            dd_updates.append(gr.update(value=_best_match(speakers[i]), choices=CONV_VOICES_CACHE, visible=True))
+            row_updates.append(gr.update(visible=True))
+        else:
+            name_updates.append(gr.update(value="", visible=False))
+            dd_updates.append(gr.update(value=None, choices=CONV_VOICES_CACHE, visible=False))
+            row_updates.append(gr.update(visible=False))
+
+    return name_updates + dd_updates + row_updates
 
 
 # --- 4. UI SETUP ---
@@ -1159,6 +1483,13 @@ css = """
     padding: 1px 4px;
     border-radius: 4px;
 }
+.script-box textarea {
+    font-family: 'Inter', sans-serif;
+    line-height: 1.6;
+}
+.speaker-table {
+    margin-top: 10px;
+}
 """
 
 EXAMPLES_LIST = [
@@ -1173,6 +1504,8 @@ head_html = """
 """
 
 with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo:
+    # Session ID for cancellation tracking
+    session_id_state = gr.State("")
 
     with gr.Column(elem_classes="container"):
         gr.HTML("""
@@ -1186,9 +1519,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
             <strong>Models:</strong>
             <a href="https://huggingface.co/pnnbao-ump/VieNeu-TTS" target="_blank" class="model-card-link">VieNeu-TTS</a>
             <span>•</span>
-            <a href="https://huggingface.co/pnnbao-ump/VieNeu-TTS-0.3B" target="_blank" class="model-card-link">VieNeu-TTS-0.3B</a>
-            <span>•</span>
-            <a href="https://huggingface.co/pnnbao-ump/VieNeu-TTS-v2-Turbo" target="_blank" class="model-card-link">VieNeu-TTS-v2 (Turbo)</a>
+            <a href="https://huggingface.co/pnnbao-ump/VieNeu-TTS-v2" target="_blank" class="model-card-link">VieNeu-TTS-v2</a>
         </div>
         <div class="model-card-item">
             <strong>Repository:</strong>
@@ -1217,10 +1548,8 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                 )
 
                 # --- BACKBONE & CODEC DEFAULT LOGIC ---
-                if "VieNeu-TTS (GPU)" in BACKBONE_CONFIGS:
-                    default_backbone = "VieNeu-TTS (GPU)"
-                elif "VieNeu-TTS-v2-Turbo (GPU)" in BACKBONE_CONFIGS:
-                    default_backbone = "VieNeu-TTS-v2-Turbo (GPU)"
+                if "VieNeu-TTS-v2 (GPU)" in BACKBONE_CONFIGS:
+                    default_backbone = "VieNeu-TTS-v2 (GPU)"
                 elif "VieNeu-TTS-v2-Turbo (CPU)" in BACKBONE_CONFIGS:
                     default_backbone = "VieNeu-TTS-v2-Turbo (CPU)"
                 else:
@@ -1298,13 +1627,13 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                     <div class="warning-banner-item">
                         <strong>🐆 Hệ máy GPU</strong>
                         <div class="warning-banner-content">
-                            Để có độ chính xác cao nhất và giọng đọc tự nhiên nhất, hãy sử dụng <b>VieNeu-TTS (Mặc định - GPU)</b>. Chọn <b>VieNeu-TTS-0.3B (GPU)</b> để tăng tốc độ lên gấp 2 lần (độ chính xác đạt khoảng 95% so với bản gốc). 
+                            Chế độ podcast và song ngữ Anh Việt đã được hỗ trợ bắt đầu từ phiên bản <b>VieNeu-TTS-v2</b>, tuy nhiên quá trình kiểm thử vẫn đang tiếp tục, có thể sẽ xảy ra lỗi không mong muốn, nếu có lỗi các bạn hãy thông báo với chúng tôi tại: https://discord.com/invite/yJt8kzjzWZ. Trong trường hợp bạn cần sự ổn định hãy sử dụng <b>VieNeu-TTS (GPU)</b>. 
                         </div>
                     </div>
                     <div class="warning-banner-item" style="background: #dcfce7; border-color: #86efac;">
                         <strong style="color: #15803d;">🚀 VieNeu-TTS-v2</strong>
                         <div class="warning-banner-content" style="color: #166534;">
-                            Phiên bản <b>VieNeu-TTS-v2</b> đang trong quá trình phát triển nhằm hỗ trợ <b>song ngữ Anh-Việt</b>. Phiên bản <b>v2 Turbo</b> được ra mắt trước nhằm mục đích thử nghiệm.
+                            Phiên bản <b>VieNeu-TTS-v2</b> hỗ trợ <b>song ngữ Anh-Việt</b> và <b>hội thoại</b>. Hiện đã có cả bản <b>GPU</b> và <b>CPU (GGUF)</b>. 
                         </div>
                     </div>
                 </div>
@@ -1317,48 +1646,114 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
         with gr.Row(elem_classes="container"):
             # --- INPUT ---
             with gr.Column(scale=3):
-                text_input = gr.Textbox(
-                    label=f"Văn bản",
-                    lines=8,
-                    value=default_text,
-                )
-                
-                with gr.Tabs() as tabs:
-                    with gr.TabItem("👤 Preset", id="preset_mode") as tab_preset:
-                        voice_select = gr.Dropdown(choices=[], value=None, label="Giọng mẫu")
-                    
-                    with gr.TabItem("🦜 Voice Cloning", id="custom_mode") as tab_custom:
-                        # turbo_v2_cloning_notice = gr.Markdown(
-                        #     "⚠️ **Thông báo:** Bản Turbo không hỗ trợ chức năng Voice Cloning. Vui lòng sử dụng bản **VieNeu-TTS (GPU)** hoặc chờ đến khi phiên bản **VieNeu-TTS-v2** chính thức ra mắt.", 
-                        #     visible=True,
-                        #     elem_id="turbo-cloning-notice"
-                        # )
+                with gr.Tabs() as main_input_tabs:
+                    # --- TAB 1: SINGLE SPEAKER ---
+                    with gr.Tab("🦜 Đọc truyện", id="single_tab") as single_tab:
+                        text_input = gr.Textbox(
+                            label=f"Văn bản",
+                            lines=8,
+                            value=default_text,
+                        )
                         
-                        with gr.Group(visible=True) as cloning_elements_group:
-                            custom_audio = gr.Audio(label="Audio giọng mẫu (3-5 giây) (.wav)", type="filepath")
-                            cloning_warning_msg = gr.Markdown(visible=False, elem_id="cloning-warning")
-                            custom_text = gr.Textbox(label="Nội dung audio mẫu - vui lòng gõ đúng nội dung của audio mẫu - kể cả dấu câu vì model rất nhạy cảm với dấu câu (.,?!)")
-                            gr.Examples(
-                                examples=[
-                                    [os.path.join(os.path.dirname(os.path.dirname(__file__)), "examples", "audio_ref", "example.wav"), "Ví dụ 2. Tính trung bình của dãy số."],
-                                    [os.path.join(os.path.dirname(os.path.dirname(__file__)), "examples", "audio_ref", "example_2.wav"), "Trên thực tế, các nghi ngờ đã bắt đầu xuất hiện."],
-                                    [os.path.join(os.path.dirname(os.path.dirname(__file__)), "examples", "audio_ref", "example_3.wav"), "Cậu có nhìn thấy không?"],
-                                    [os.path.join(os.path.dirname(os.path.dirname(__file__)), "examples", "audio_ref", "example_4.wav"), "Tết là dịp mọi người háo hức đón chào một năm mới với nhiều hy vọng và mong ước."]
-                                ],
-                                inputs=[custom_audio, custom_text],
-                                label="Ví dụ mẫu để thử nghiệm clone giọng"
-                            )
+                        with gr.Tabs() as tabs:
+                            with gr.TabItem("👤 Preset", id="preset_mode") as tab_preset:
+                                voice_select = gr.Dropdown(choices=[], value=None, label="Giọng mẫu", allow_custom_value=True)
                             
-                            gr.Markdown("""
-                            **💡 Mẹo nhỏ:** Nếu kết quả Zero-shot Voice Cloning chưa như ý, bạn hãy cân nhắc **Finetune (LoRA)** để đạt chất lượng tốt nhất. 
-                            Hướng dẫn chi tiết có tại file: `finetune/README.md` hoặc xem trên [GitHub](https://github.com/pnnbao97/VieNeu-TTS/tree/main/finetune).
-                            """)
-                
-                generation_mode = gr.Radio(
-                    ["Standard (Một lần)"],
-                    value="Standard (Một lần)",
-                    label="Chế độ sinh"
-                )
+                            with gr.TabItem("🦜 Voice Cloning", id="custom_mode") as tab_custom:
+                                with gr.Group(visible=True) as cloning_elements_group:
+                                    custom_audio = gr.Audio(label="Audio giọng mẫu (3-5 giây) (.wav)", type="filepath")
+                                    cloning_warning_msg = gr.Markdown(visible=False, elem_id="cloning-warning")
+                                    custom_text = gr.Textbox(label="Nội dung audio mẫu - vui lòng gõ đúng nội dung của audio mẫu - kể cả dấu câu vì model rất nhạy cảm với dấu câu (.,?!)")
+                                    gr.Examples(
+                                        examples=[
+                                            [os.path.join(os.path.dirname(os.path.dirname(__file__)), "examples", "audio_ref", "example.wav"), "Ví dụ 2. Tính trung bình của dãy số."],
+                                            [os.path.join(os.path.dirname(os.path.dirname(__file__)), "examples", "audio_ref", "example_2.wav"), "Trên thực tế, các nghi ngờ đã bắt đầu xuất hiện."],
+                                            [os.path.join(os.path.dirname(os.path.dirname(__file__)), "examples", "audio_ref", "example_3.wav"), "Cậu có nhìn thấy không?"],
+                                            [os.path.join(os.path.dirname(os.path.dirname(__file__)), "examples", "audio_ref", "example_4.wav"), "Tết là dịp mọi người háo hức đón chào một năm mới với nhiều hy vọng và mong ước."]
+                                        ],
+                                        inputs=[custom_audio, custom_text],
+                                        label="Ví dụ mẫu để thử nghiệm clone giọng"
+                                    )
+                                    
+                                    gr.Markdown("""
+                                    **💡 Mẹo nhỏ:** Nếu kết quả Zero-shot Voice Cloning chưa như ý, bạn hãy cân nhắc **Finetune (LoRA)** để đạt chất lượng tốt nhất. 
+                                    Hướng dẫn chi tiết có tại file: `finetune/README.md` hoặc xem trên [GitHub](https://github.com/pnnbao97/VieNeu-TTS/tree/main/finetune).
+                                    """)
+                        
+                        generation_mode = gr.Radio(
+                            ["Standard (Một lần)"],
+                            value="Standard (Một lần)",
+                            label="Chế độ sinh"
+                        )
+                        btn_generate = gr.Button("🎵 Bắt đầu", variant="primary", scale=2, interactive=False)
+
+                    # --- TAB 2: MULTI-SPEAKER CONVERSATION ---
+                    with gr.Tab("🎭 Hội thoại", id="conv_tab", visible=False) as conv_tab:
+                        conv_script_input = gr.Textbox(
+                            label="Kịch bản hội thoại",
+                            placeholder="Phương: Chào mọi người, mình là Phương...",
+                            lines=10,
+                            elem_classes="script-box",
+                            value='Phương: Chào mọi người, mình là Phương. Hôm nay team có một announcement cực lớn về VieNeu-TTS Version 2. Đồng hành cùng mình là anh Dũng và Hùng. Hi guys!\n\nDũng: Yo, chào cả nhà. Mình sẽ đi thẳng vào technical side của bản nâng cấp này để mọi người có cái nhìn deep hơn nhé.\n\nHùng: Chào mọi người. Thật sự V2 là một huge milestone. Nó phá vỡ rào cản của những công cụ đọc văn bản khô khan, hướng tới một sự natural communication đúng nghĩa.\n\nPhương: Correct! Và bất ngờ nhất là: nãy giờ mọi người đang nghe bản demo được tạo ra 100% bằng VieNeu-TTS V2 đấy. Tụi mình đều là sản phẩm của AI hết. Amazing, right?\n\nDũng: Đỉnh thật sự! Tiện đây Hùng share thêm về cái nội công bên trong của model này đi.\n\nHùng: Chắc chắn rồi. Model được train trên 10,000 hours audio chất lượng cao, nên nó hỗ trợ code-switching Anh Việt cực mượt, tự nhiên như podcast. Đặc biệt, dự án này hoàn toàn open-source để cộng đồng cùng phát triển.\n\nDũng: Về hiệu năng thì khỏi bàn. Khi test trên GPU quốc dân RTX 3060, tốc độ sinh audio nhanh gấp 10 lần realtime. Và đừng lo, nếu bạn không có card đồ hỏa xịn, tụi mình có sẵn bản CPU version để ai cũng có thể tiếp cận được.\n\nPhương: Tốc độ cực nhanh, hỗ trợ đa nền tảng và hoàn toàn miễn phí. Mọi người hãy cùng trải nghiệm nhé!'
+                        )
+                        
+                        with gr.Row():
+                            btn_detect_speakers = gr.Button("🔍 Quét nhân vật", size="sm", variant="secondary")
+                            silence_slider = gr.Slider(minimum=0, maximum=3, value=0.1, step=0.1, label="⏱️ Khoảng lặng (giây)")
+
+                        gr.Markdown("### 🎭 Cấu hình giọng đọc")
+                        gr.Markdown("*Nhấn **Quét nhân vật** để tự động phát hiện và ánh xạ giọng đọc. Tải model trước để có danh sách giọng.*")
+
+                        # Pre-build MAX_SPEAKERS speaker slot rows
+                        speaker_name_boxes = []
+                        speaker_voice_dds  = []
+                        speaker_slot_rows  = []
+
+                        for _i in range(MAX_SPEAKERS):
+                            # Mặc định cho 3 nhân vật đầu tiên theo yêu cầu
+                            _default_name = ""
+                            _default_voice = None
+                            _row_visible = False
+                            
+                            if _i == 0:
+                                _default_name = "Phương"
+                                _default_voice = "Trúc Ly (nữ miền Bắc)"
+                                _row_visible = True
+                            elif _i == 1:
+                                _default_name = "Dũng"
+                                _default_voice = "Thanh Bình (nam miền Bắc)"
+                                _row_visible = True
+                            elif _i == 2:
+                                _default_name = "Hùng"
+                                _default_voice = "Thái Sơn (nam miền Nam)"
+                                _row_visible = True
+                            elif _i < 2:
+                                _default_name = f"Nhân vật {_i+1}"
+                                _row_visible = True
+
+                            with gr.Row(visible=_row_visible) as _row:
+                                _name = gr.Textbox(
+                                    value=_default_name,
+                                    label="👤 Nhân vật",
+                                    interactive=False,
+                                    scale=1,
+                                    min_width=120
+                                )
+                                _dd = gr.Dropdown(
+                                    choices=PRESET_VOICES_CACHE,
+                                    value=_default_voice,
+                                    label="🎤 Giọng đọc",
+                                    interactive=True,
+                                    scale=3,
+                                    allow_custom_value=True
+                                )
+                            speaker_slot_rows.append(_row)
+                            speaker_name_boxes.append(_name)
+                            speaker_voice_dds.append(_dd)
+                        
+                        btn_generate_conv = gr.Button("🎭 Bắt đầu hội thoại", variant="primary", interactive=False)
+
+                # Global Generation Settings
                 with gr.Row():
                     use_batch = gr.Checkbox(
                         value=True, 
@@ -1387,11 +1782,10 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                             info="Độ dài tối đa mỗi đoạn xử lý."
                         )
                 
-                # State to track current mode (replaces unreliable Textbox/Tabs input)
+                # State to track current mode
                 current_mode_state = gr.State("preset_mode")
                 
                 with gr.Row():
-                    btn_generate = gr.Button("🎵 Bắt đầu", variant="primary", scale=2, interactive=False)
                     btn_stop = gr.Button("⏹️ Dừng", variant="stop", scale=1, interactive=False)
             
             # --- OUTPUT ---
@@ -1533,31 +1927,68 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
             fn=load_model,
             inputs=[backbone_select, codec_select, device_choice, use_lmdeploy_cb,
                     custom_backbone_model_id, custom_backbone_base_model, custom_backbone_hf_token],
-            outputs=[model_status, btn_generate, btn_load, btn_stop, voice_select, tab_preset, tab_custom, tabs, current_mode_state]
+            outputs=[model_status, btn_generate, btn_generate_conv, btn_load, btn_stop, voice_select,
+                     tab_preset, tab_custom, tabs, current_mode_state,
+                     conv_tab,
+                     *speaker_voice_dds]
         )
         
+        # --- Conversation Event Handlers ---
+        # Scan speakers → update all 8 slot rows/names/dropdowns
+        btn_detect_speakers.click(
+            fn=extract_speakers_from_script,
+            inputs=[conv_script_input],
+            outputs=speaker_name_boxes + speaker_voice_dds + speaker_slot_rows
+        )
         
-        generate_event = btn_generate.click(
+        conv_gen_event = btn_generate_conv.click(
+            fn=synthesize_conversation,
+            inputs=[conv_script_input,
+                    *speaker_name_boxes,
+                    *speaker_voice_dds,
+                    silence_slider, temperature_slider, max_chars_chunk_slider,
+                    session_id_state],
+            outputs=[audio_output, status_output]
+        )
+        btn_generate_conv.click(lambda: gr.update(interactive=True), outputs=btn_stop)
+        conv_gen_event.then(lambda: gr.update(interactive=False), outputs=btn_stop)
+
+        # --- Auto-adjust Temperature on Tab Switch ---
+        conv_tab.select(
+            fn=lambda: gr.update(value=1.0),
+            outputs=temperature_slider
+        )
+        single_tab.select(
+            fn=lambda: gr.update(value=default_temp),
+            outputs=temperature_slider
+        )
+        
+        # --- Standard Generation Handlers ---
+        gen_event = btn_generate.click(
             fn=synthesize_speech,
             inputs=[text_input, voice_select, custom_audio, custom_text, current_mode_state, 
                     generation_mode, use_batch, max_batch_size_run,
-                    temperature_slider, max_chars_chunk_slider],
+                    temperature_slider, max_chars_chunk_slider, session_id_state],
             outputs=[audio_output, status_output]
         )
-        
-        # When generation starts, enable stop button
         btn_generate.click(lambda: gr.update(interactive=True), outputs=btn_stop)
-        # When generation ends/stops, disable stop button
-        generate_event.then(lambda: gr.update(interactive=False), outputs=btn_stop)
-        
-        btn_stop.click(fn=None, cancels=[generate_event])
-        btn_stop.click(lambda: (None, "⏹️ Đã dừng tạo giọng nói."), outputs=[audio_output, status_output])
-        btn_stop.click(lambda: gr.update(interactive=False), outputs=btn_stop)
+        gen_event.then(lambda: gr.update(interactive=False), outputs=btn_stop)
+
+        # --- Stop Button ---
+        def request_stop():
+            print("🛑 STOP REQUESTED via button click.")
+            _STOP_EVENT.set()
+            return None, "⏹️ Đã dừng tạo giọng nói.", gr.update(interactive=False)
+
+        # Handler: set stop event + update UI
+        # Note: We avoid cancels= here to prevent internal Gradio KeyError crashes,
+        # relying instead on the frequent _STOP_EVENT.is_set() checks in the code.
+        btn_stop.click(fn=request_stop, outputs=[audio_output, status_output, btn_stop])
 
         # Persistence: Restore UI state on load
         demo.load(
             fn=restore_ui_state,
-            outputs=[model_status, btn_generate, btn_stop]
+            outputs=[model_status, btn_generate, btn_generate_conv, btn_stop]
         )
 
 def main():
