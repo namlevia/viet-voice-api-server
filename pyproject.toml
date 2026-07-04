@@ -77,7 +77,6 @@ dependencies = [
     "PyYAML",               # gradio config.yaml
     "gradio>=5.49.1",       # web UI (vieneu-web)
     "perth>=0.2.0",         # optional audio watermark (skipped gracefully if absent)
-    "PyMuPDF>=1.25.0",      # PDF text extraction (fitz)
 ]
 
 [project.urls]
@@ -102,6 +101,12 @@ gpu = [
     "triton; sys_platform == 'linux'",
     "accelerate; sys_platform == 'darwin'",
     "llama-cpp-python==0.3.16",
+]
+
+# PDF text extraction. Separate from core to keep the minimal install torch-free.
+# Install with: pip install vieneu[pdf]
+pdf = [
+    "PyMuPDF>=1.25.0",
 ]
 
 [dependency-groups]
