@@ -42,12 +42,29 @@ class PhoneChunk:
 
 # ─── Audio utils ─────────────────────────────────────────────────────────────
 
+# Im lặng (giây) chèn giữa hai chunk tuỳ RANH GIỚI đã cắt: ngắt đoạn (\n) nghỉ
+# dài nhất, hết câu (.!?) nghỉ vừa, ngắt trong câu (,;: hoặc cắt cưỡng bức) gần
+# như liền mạch. Dùng cho đường v3 khi có metadata gap từ splitter.
+V3_GAP_SILENCE = {"para": 0.35, "sentence": 0.18, "minor": 0.04}
+
+
+def gaps_to_silence(gaps: List[str]) -> List[float]:
+    """Map list loại-ranh-giới -> list độ dài im lặng (giây) cho ``join_audio_chunks``."""
+    return [V3_GAP_SILENCE.get(g, V3_GAP_SILENCE["sentence"]) for g in gaps]
+
+
 def join_audio_chunks(
     chunks: List[np.ndarray],
     sr: int,
     silence_p: float = 0.0,
     crossfade_p: float = 0.0,
+    silence_ps: Optional[List[float]] = None,
 ) -> np.ndarray:
+    """Ghép các chunk audio. ``silence_ps`` (tuỳ chọn) cho im lặng RIÊNG từng khe
+    nối — ``silence_ps[i]`` là im lặng (giây) giữa chunk ``i`` và ``i+1`` — dùng để
+    nghỉ dài/ngắn khác nhau theo loại ranh giới. Khi truyền ``silence_ps`` thì
+    ``silence_p``/``crossfade_p`` bị bỏ qua.
+    """
     if not chunks:
         return np.array([], dtype=np.float32)
     if len(chunks) == 1:
@@ -59,7 +76,14 @@ def join_audio_chunks(
 
     for i in range(1, len(chunks)):
         next_chunk = chunks[i]
-        if silence_samples > 0:
+        if silence_ps is not None:
+            gap_samples = int(sr * silence_ps[i - 1]) if i - 1 < len(silence_ps) else 0
+            if gap_samples > 0:
+                silence   = np.zeros(gap_samples, dtype=np.float32)
+                final_wav = np.concatenate([final_wav, silence, next_chunk])
+            else:
+                final_wav = np.concatenate([final_wav, next_chunk])
+        elif silence_samples > 0:
             silence   = np.zeros(silence_samples, dtype=np.float32)
             final_wav = np.concatenate([final_wav, silence, next_chunk])
         elif crossfade_samples > 0:
@@ -135,6 +159,49 @@ def split_text_into_chunks(text: str, max_chars: int = 256) -> List[str]:
             final_chunks.append(buffer)
 
     return [c.strip() for c in final_chunks if c.strip()]
+
+
+def _classify_gap(chunk: str) -> str:
+    """Phân loại ranh giới NGAY SAU ``chunk`` dựa trên dấu câu cuối: hết câu
+    (``.!?``) -> ``"sentence"``; còn lại (``,;:`` hoặc cắt cưỡng bức giữa câu)
+    -> ``"minor"``. Ranh giới ``"para"`` (ngắt đoạn) do caller gán riêng."""
+    c = chunk.rstrip()
+    return "sentence" if c and c[-1] in ".!?" else "minor"
+
+
+def split_text_into_chunks_with_gaps(
+    text: str, max_chars: int = 256
+) -> Tuple[List[str], List[str]]:
+    """Như :func:`split_text_into_chunks` nhưng trả kèm loại ranh giới GIỮA các
+    chunk để ghép audio nghỉ dài/ngắn khác nhau.
+
+    Trả về ``(chunks, gaps)`` với ``gaps[i] in {"para","sentence","minor"}`` là
+    ranh giới giữa ``chunks[i]`` và ``chunks[i+1]`` (``len(gaps) == len(chunks)-1``):
+      * ``"para"``     — hai chunk khác ĐOẠN (cách nhau bởi ``\\n``) -> nghỉ dài
+      * ``"sentence"`` — hết câu (chunk trái tận cùng ``.!?``)       -> nghỉ vừa
+      * ``"minor"``    — ngắt trong câu (``,;:`` / cắt cưỡng bức)     -> gần như liền
+    """
+    if not text:
+        return [], []
+
+    paragraphs = RE_NEWLINE.split(text.strip())
+    chunks: List[str] = []
+    gaps: List[str] = []
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        para_chunks = split_text_into_chunks(para, max_chars=max_chars)
+        if not para_chunks:
+            continue
+        if chunks:                       # ranh giới với đoạn TRƯỚC đó là ngắt đoạn
+            gaps.append("para")
+        for j, ch in enumerate(para_chunks):
+            if j > 0:                    # ranh giới trong CÙNG đoạn: theo dấu câu
+                gaps.append(_classify_gap(para_chunks[j - 1]))
+            chunks.append(ch)
+
+    return chunks, gaps
 
 # ─── v2 helpers ──────────────────────────────────────────────────────────────
 

@@ -20,8 +20,8 @@ import queue
 import threading
 import yaml
 import uuid
-from vieneu_utils.core_utils import join_audio_chunks, env_bool, get_silence_duration_v2
-from vieneu_utils.phonemize_text import phonemize_to_chunks, normalize_to_chunks, normalize_to_chunks_v3
+from vieneu_utils.core_utils import join_audio_chunks, env_bool, get_silence_duration_v2, gaps_to_silence
+from vieneu_utils.phonemize_text import phonemize_to_chunks, normalize_to_chunks, normalize_to_chunks_v3, normalize_to_chunks_v3_with_gaps
 # PuncNormalizer = sea_g2p.Normalizer luôn bật punc_norm=True.
 from vieneu_utils.phonemize_text import PuncNormalizer as Normalizer
 import gc
@@ -896,7 +896,7 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
 
                 # Chia chunk theo TEXT đã normalize (giống v2-gpu, không vụn), giữ
                 # inline cues; phonemize TỪNG chunk khi dựng request.
-                v3_chunks = normalize_to_chunks_v3(raw_text, max_chars=max_chars_chunk)
+                v3_chunks, v3_gaps = normalize_to_chunks_v3_with_gaps(raw_text, max_chars=max_chars_chunk)
                 v3_bs = max(1, int(max_batch_size_run)) if use_batch else 1
                 v3_engine_dev = getattr(getattr(tts, "engine", None), "device", None)
                 v3_can_batch = (
@@ -920,7 +920,7 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
                                  "ref_codes": ref_codes, "style": style_key, "use_ref_codes": True} for c in group]
                         v3_wavs.extend(tts._v3_batch_engine.generate_batch(
                             reqs, temperature=temperature, max_new_frames=300))
-                    wav = join_audio_chunks(v3_wavs, sr=sr_v3, silence_p=0.15)
+                    wav = join_audio_chunks(v3_wavs, sr=sr_v3, silence_ps=gaps_to_silence(v3_gaps))
                 else:
                     # CPU (ONNX) hoặc GPU khi tắt batch: xử lý TUẦN TỰ từng đoạn.
                     # Dùng infer_stream (yield 1 wav / đoạn) thay vì infer (chạy toàn
@@ -956,7 +956,7 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
                                 f"(ước tính còn lại: {_format_duration(eta)})... "
                                 f"đang xử lý đoạn {done + 1}/{total_v3}"
                             )
-                    wav = join_audio_chunks(v3_wavs, sr=sr_v3, silence_p=0.15)
+                    wav = join_audio_chunks(v3_wavs, sr=sr_v3, silence_ps=gaps_to_silence(v3_gaps))
             except Exception as e:
                 yield None, f"❌ Lỗi tổng hợp (v3 Turbo): {str(e)}"
                 return
@@ -1322,8 +1322,8 @@ def _synthesize_conversation_v3(lines, mapping, temperature, max_chars_chunk, si
     """
     global tts
     from collections import defaultdict
-    from vieneu_utils.core_utils import join_audio_chunks
-    from vieneu_utils.phonemize_text import phonemize_text_with_emotions, normalize_to_chunks_v3
+    from vieneu_utils.core_utils import join_audio_chunks, gaps_to_silence
+    from vieneu_utils.phonemize_text import phonemize_text_with_emotions, normalize_to_chunks_v3_with_gaps
     # NOTE: KHÔNG import vieneu.v3_turbo_serve ở đây — module đó import torch ở cấp
     # module, nên trên bản cài CPU/macOS không-torch (ONNX) sẽ lỗi "No module named
     # 'torch'". Chỉ import bên trong nhánh CUDA bên dưới (nơi thực sự cần batch engine).
@@ -1383,6 +1383,7 @@ def _synthesize_conversation_v3(lines, mapping, temperature, max_chars_chunk, si
 
     voice_cache = {}
     reqs, req_line = [], []
+    line_gaps = {}
     for li, line in enumerate(lines):
         key = line['speaker'].lower()
         if key not in voice_cache:
@@ -1390,7 +1391,8 @@ def _synthesize_conversation_v3(lines, mapping, temperature, max_chars_chunk, si
         spk_emb, ref_codes = voice_cache[key]
         # Chia chunk theo TEXT đã normalize (giống v2-gpu), giữ inline cues, rồi
         # phonemize từng chunk. Hội thoại luôn dùng phong cách Tự nhiên.
-        for chunk in normalize_to_chunks_v3(line['text'], max_chars=max_chars_chunk):
+        line_chunks, line_gaps[li] = normalize_to_chunks_v3_with_gaps(line['text'], max_chars=max_chars_chunk)
+        for chunk in line_chunks:
             reqs.append({"phonemes": phonemize_text_with_emotions(chunk),
                          "speaker_emb": spk_emb, "ref_codes": ref_codes,
                          "style": "tu_nhien", "use_ref_codes": True})
@@ -1424,7 +1426,7 @@ def _synthesize_conversation_v3(lines, mapping, temperature, max_chars_chunk, si
 
     all_wavs = []
     for li in range(len(lines)):
-        lw = join_audio_chunks(by_line[li], sr=sr, silence_p=0.15) if by_line[li] else None
+        lw = join_audio_chunks(by_line[li], sr=sr, silence_ps=gaps_to_silence(line_gaps.get(li, []))) if by_line[li] else None
         if lw is None or len(lw) == 0:
             continue
         all_wavs.append(lw)
@@ -2017,9 +2019,9 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                         )
                         max_chars_chunk_slider = gr.Slider(
                             minimum=128, maximum=512,
-                            value=(384 if "v3" in default_backbone.lower() else 256), step=32,
+                            value=256, step=32,
                             label="📝 Max Chars per Chunk",
-                            info="Độ dài tối đa mỗi đoạn xử lý (mặc định v3 Turbo: 384, v2: 256)."
+                            info="Độ dài tối đa mỗi đoạn xử lý (mặc định: 256)."
                         )
                 
                 # State to track current mode
@@ -2131,7 +2133,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                 gr.update(visible=not is_v3),  # use_lmdeploy_cb — irrelevant for v3 (PyTorch, no LMDeploy)
                 gr.update(visible=is_v2_gpu),  # custom_text — only v2 needs a reference transcript
                 clone_info_update,             # clone_info_md
-                gr.update(value=384 if is_v3 else 256),  # max_chars_chunk_slider — v3 chunks longer
+                gr.update(value=256),  # max_chars_chunk_slider
             )
 
         backbone_select.change(

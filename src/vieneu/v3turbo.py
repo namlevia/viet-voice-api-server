@@ -14,8 +14,12 @@ from typing import Any, Generator, List, Optional, Tuple, Union
 import numpy as np
 
 from .base import BaseVieneuTTS
-from vieneu_utils.phonemize_text import phonemize_text_with_emotions, normalize_to_chunks_v3
-from vieneu_utils.core_utils import join_audio_chunks
+from vieneu_utils.phonemize_text import (
+    phonemize_text_with_emotions,
+    normalize_to_chunks_v3,
+    normalize_to_chunks_v3_with_gaps,
+)
+from vieneu_utils.core_utils import join_audio_chunks, gaps_to_silence
 
 logger = logging.getLogger("Vieneu.V3Turbo")
 
@@ -231,7 +235,7 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
         top_p: float = 0.95,
         max_new_frames: int = 300,
         repetition_penalty: float = 1.2,
-        max_chars: int = 384,
+        max_chars: int = 256,
         silence_p: float = 0.15,
         crossfade_p: float = 0.0,
         apply_watermark: bool = True,
@@ -239,7 +243,7 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
     ) -> np.ndarray:
         speaker_emb, ref_codes = self._resolve_ref(voice, ref_audio, denoise, use_ref_codes)
 
-        chunks = normalize_to_chunks_v3(text, max_chars=max_chars)
+        chunks, gaps = normalize_to_chunks_v3_with_gaps(text, max_chars=max_chars)
         if not chunks:
             return np.array([], dtype=np.float32)
 
@@ -254,7 +258,10 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
             )
             all_wavs.append(wav)
 
-        final_wav = join_audio_chunks(all_wavs, self.sample_rate, silence_p, crossfade_p)
+        # Im lặng theo loại ranh giới: ngắt đoạn > hết câu > ngắt trong câu.
+        final_wav = join_audio_chunks(
+            all_wavs, self.sample_rate, silence_ps=gaps_to_silence(gaps)
+        )
         return self._apply_watermark(final_wav) if apply_watermark else final_wav
 
     def infer_stream(
@@ -270,7 +277,7 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
         top_p: float = 0.95,
         max_new_frames: int = 300,
         repetition_penalty: float = 1.2,
-        max_chars: int = 384,
+        max_chars: int = 256,
         apply_watermark: bool = True,
         **kwargs: Any,
     ) -> Generator[np.ndarray, None, None]:

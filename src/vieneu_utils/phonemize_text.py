@@ -282,6 +282,55 @@ def normalize_to_chunks_v3(text: str, max_chars: int = 256) -> list[str]:
     return [punc_norm(c) for c in split_text_into_chunks(normalized, max_chars=max_chars)]
 
 
+def normalize_to_chunks_v3_with_gaps(
+    text: str, max_chars: int = 256
+) -> tuple[list[str], list[str]]:
+    """Như :func:`normalize_to_chunks_v3` nhưng trả kèm loại ranh giới GIỮA các
+    chunk để ghép audio nghỉ dài/ngắn theo ngữ cảnh.
+
+    Trả về ``(chunks, gaps)`` với ``gaps[i] in {"para","sentence","minor"}`` là
+    ranh giới giữa ``chunks[i]`` và ``chunks[i+1]`` (``len(gaps) == len(chunks)-1``).
+    Dùng với :func:`vieneu_utils.core_utils.gaps_to_silence` +
+    ``join_audio_chunks(..., silence_ps=...)``.
+
+    Ranh giới ``sentence``/``minor`` được phân loại LẠI trên chunk ĐÃ ``punc_norm``
+    (punc_norm có thể ép dấu cuối cho câu ngắn) để khớp intonation audio thật;
+    ``para`` (ngắt đoạn) giữ nguyên. Đường có emotion cue ghép các đoạn bằng dấu
+    cách nên không còn ranh giới ``para``.
+    """
+    from vieneu_utils.core_utils import (
+        split_text_into_chunks_with_gaps,
+        _classify_gap,
+    )
+
+    if not text:
+        return [], []
+
+    if "[" not in text and "<|emotion_" not in text:
+        normalizer = _get_normalizer()
+        paragraphs = [p for p in RE_NEWLINE_SPLIT.split(text) if p.strip()]
+        normalized = (
+            "\n".join(normalizer.normalize_batch(paragraphs, punc_norm=True))
+            if paragraphs
+            else ""
+        )
+    else:
+        normalizer = _get_normalizer()
+        rebuilt = []
+        for i, part in enumerate(_EMOTION_SPLIT_RE.split(text)):
+            if i % 2 == 1:
+                tok = _emotion_tag_token(part)
+                rebuilt.append(tok if tok is not None else part)
+            elif part.strip():
+                rebuilt.append(normalizer.normalize(part, punc_norm=False))
+        normalized = " ".join(p for p in rebuilt if p)
+
+    chunks, gaps = split_text_into_chunks_with_gaps(normalized, max_chars=max_chars)
+    chunks = [punc_norm(c) for c in chunks]
+    gaps = [g if g == "para" else _classify_gap(chunks[i]) for i, g in enumerate(gaps)]
+    return chunks, gaps
+
+
 def phonemize_to_chunks(
     text: str,
     max_chars: int = 256,
