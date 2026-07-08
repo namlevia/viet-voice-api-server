@@ -25,6 +25,32 @@ Returns server/model status.
 
 Returns preset voices and supported speaking styles.
 
+Example:
+
+```bash
+curl http://127.0.0.1:8008/voices
+```
+
+Response shape:
+
+```json
+{
+  "default_voice": "Phạm Tuyên",
+  "voices": [
+    {
+      "label": "Trúc Ly — Nữ · Bắc · Phong cách tự nhiên",
+      "id": "Trúc Ly"
+    }
+  ],
+  "styles": [
+    {
+      "label": "Tự nhiên",
+      "id": "tu_nhien"
+    }
+  ]
+}
+```
+
 ### `POST /tts`
 
 Returns `audio/wav` directly.
@@ -69,3 +95,66 @@ curl -X POST http://127.0.0.1:8008/tts/file \
 - `denoise`: default `true`
 - `use_ref_codes`: default `true`
 - `apply_watermark`: default `true`
+
+## Voice Names
+
+Use `GET /voices` to list built-in voices. Pass the `id` value as `voice`.
+
+Example voice ids:
+
+- `Phạm Tuyên`
+- `Trúc Ly`
+- `Thái Sơn`
+- `Xuân Vĩnh`
+- `Thanh Bình`
+- `Minh Đức`
+- `Ngọc Linh`
+- `Đoan Trang`
+- `Mai Anh`
+- `Thục Đoan`
+
+## Emotion And Non-Verbal Tags
+
+VieNeu v3 Turbo supports inline emotion/non-verbal cue tags inside `text`.
+These are not separate API parameters. Put the tag directly where the sound or
+style cue should happen.
+
+Supported experimental tags:
+
+- `[cười]`: laughing / smiling cue
+- `[hắng giọng]`: throat-clearing cue
+- `[thở dài]`: sigh cue
+
+Example with direct WAV output:
+
+```bash
+curl -X POST http://127.0.0.1:8008/tts \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "text": "[cười] Trời ơi, cái giọng nó tự nhiên mà nó mượt mà dã man. Để mình nói tiếp [hắng giọng], mọi người bật loa lên rồi cùng trải nghiệm nhé!",
+    "voice": "Phạm Tuyên",
+    "style": "tu_nhien",
+    "temperature": 0.8,
+    "max_chars": 256
+  }' \
+  --output output.wav
+```
+
+Example returning a JSON file URL:
+
+```bash
+curl -X POST http://127.0.0.1:8008/tts/file \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "text": "[cười] Xin chào anh. Đây là server TTS VieNeu. [thở dài] Nghe cũng khá tự nhiên đúng không?",
+    "voice": "Trúc Ly",
+    "style": "tu_nhien"
+  }'
+```
+
+Notes:
+
+- Tags work only when the model/backend supports them. VieNeu v3 Turbo supports
+  these tags experimentally.
+- Keep tags in square brackets exactly as shown.
+- You can mix tags with normal Vietnamese text in one `text` string.
