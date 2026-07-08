@@ -299,7 +299,7 @@ def main():
     import uvicorn
 
     host = os.getenv("VIENEU_API_HOST", "127.0.0.1")
-    port = int(os.getenv("VIENEU_API_PORT", "8008"))
+    port = int(os.getenv("VIENEU_API_PORT", "1238"))
     uvicorn.run("apps.tts_api:app", host=host, port=port, reload=False)
 
 

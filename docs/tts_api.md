@@ -13,12 +13,12 @@ reference audio, install the extra runtime first:
 uv sync --group gpu
 ```
 
-Default URL: `http://127.0.0.1:8008`
+Default URL: `http://127.0.0.1:1238`
 
 Environment variables:
 
 - `VIENEU_API_HOST`: bind host, default `127.0.0.1`
-- `VIENEU_API_PORT`: bind port, default `8008`
+- `VIENEU_API_PORT`: bind port, default `1238`
 - `VIENEU_DEVICE`: model device, default `auto`
 - `VIENEU_OUTPUT_DIR`: output parent directory for generated audio files
 
@@ -35,7 +35,7 @@ Returns preset voices and supported speaking styles.
 Example:
 
 ```bash
-curl http://127.0.0.1:8008/voices
+curl http://127.0.0.1:1238/voices
 ```
 
 Response shape:
@@ -63,7 +63,7 @@ Response shape:
 Returns `audio/wav` directly.
 
 ```bash
-curl -X POST http://127.0.0.1:8008/tts \
+curl -X POST http://127.0.0.1:1238/tts \
   -H 'Content-Type: application/json' \
   -d '{
     "text": "Xin chào, đây là VieNeu TTS API.",
@@ -80,7 +80,7 @@ curl -X POST http://127.0.0.1:8008/tts \
 Generates a WAV file and returns JSON with `audio_url` and `audio_path`.
 
 ```bash
-curl -X POST http://127.0.0.1:8008/tts/file \
+curl -X POST http://127.0.0.1:1238/tts/file \
   -H 'Content-Type: application/json' \
   -d '{
     "text": "Xin chào, đây là VieNeu TTS API.",
@@ -96,7 +96,7 @@ reference clip and synthesize with that voice. For v3 Turbo, no reference
 transcript is needed.
 
 ```bash
-curl -X POST http://127.0.0.1:8008/tts/clone \
+curl -X POST http://127.0.0.1:1238/tts/clone \
   -F 'ref_audio=@examples/audio_ref/example.wav' \
   -F 'text=[cười] Đây là giọng được clone từ audio mẫu.' \
   -F 'style=tu_nhien' \
@@ -110,7 +110,7 @@ Clones a voice from an uploaded reference audio file and returns JSON with
 `audio_url`, `audio_path`, and `reference_audio_path`.
 
 ```bash
-curl -X POST http://127.0.0.1:8008/tts/clone/file \
+curl -X POST http://127.0.0.1:1238/tts/clone/file \
   -F 'ref_audio=@examples/audio_ref/example.wav' \
   -F 'text=Xin chào, đây là endpoint clone giọng.' \
   -F 'temperature=0.8' \
@@ -174,7 +174,7 @@ Supported experimental tags:
 Example with direct WAV output:
 
 ```bash
-curl -X POST http://127.0.0.1:8008/tts \
+curl -X POST http://127.0.0.1:1238/tts \
   -H 'Content-Type: application/json' \
   -d '{
     "text": "[cười] Trời ơi, cái giọng nó tự nhiên mà nó mượt mà dã man. Để mình nói tiếp [hắng giọng], mọi người bật loa lên rồi cùng trải nghiệm nhé!",
@@ -189,7 +189,7 @@ curl -X POST http://127.0.0.1:8008/tts \
 Example returning a JSON file URL:
 
 ```bash
-curl -X POST http://127.0.0.1:8008/tts/file \
+curl -X POST http://127.0.0.1:1238/tts/file \
   -H 'Content-Type: application/json' \
   -d '{
     "text": "[cười] Xin chào anh. Đây là server TTS VieNeu. [thở dài] Nghe cũng khá tự nhiên đúng không?",
