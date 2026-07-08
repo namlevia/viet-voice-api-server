@@ -19,7 +19,9 @@ Environment variables:
 
 - `VIENEU_API_HOST`: bind host, default `127.0.0.1`
 - `VIENEU_API_PORT`: bind port, default `1238`
-- `VIENEU_DEVICE`: model device, default `auto`
+- `VIENEU_DEVICE`: optional override. By default the API matches the Gradio
+  `Auto` behavior: `mps` on Apple Silicon when available, `cuda` on CUDA
+  machines, otherwise `cpu`
 - `VIENEU_OUTPUT_DIR`: output parent directory for generated audio files
 
 ## Endpoints

@@ -1,4 +1,5 @@
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -39,6 +40,7 @@ _tts = None
 _tts_lock = threading.Lock()
 _infer_lock = threading.Lock()
 _load_error: Optional[str] = None
+_device_used: Optional[str] = None
 
 
 class TTSRequest(BaseModel):
@@ -70,19 +72,34 @@ def _normalize_style(style: str) -> str:
 
 
 def _get_tts():
-    global _tts, _load_error
+    global _tts, _load_error, _device_used
     if _tts is not None:
         return _tts
     with _tts_lock:
         if _tts is not None:
             return _tts
         try:
-            _tts = Vieneu(mode="v3turbo", device=os.getenv("VIENEU_DEVICE", "auto"))
+            _device_used = _resolve_device()
+            _tts = Vieneu(mode="v3turbo", device=_device_used)
             _load_error = None
             return _tts
         except Exception as exc:
             _load_error = str(exc)
             raise HTTPException(status_code=503, detail=f"Failed to load VieNeu model: {exc}") from exc
+
+
+def _resolve_device() -> str:
+    """Match Gradio's Auto behavior: prefer MPS on macOS, CUDA elsewhere, CPU last."""
+    override = os.getenv("VIENEU_DEVICE")
+    if override:
+        return override.strip().lower()
+    try:
+        import torch
+        if sys.platform == "darwin":
+            return "mps" if torch.backends.mps.is_available() else "cpu"
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
 
 
 def _voice_id(tts, voice: Optional[str]) -> Optional[str]:
@@ -172,10 +189,15 @@ def _write_wav(wav: np.ndarray, sample_rate: int) -> Path:
 
 @app.get("/health")
 def health():
+    backend = getattr(_tts, "backend", None) if _tts is not None else None
+    engine_device = getattr(getattr(_tts, "engine", None), "device", None) if _tts is not None else None
     return {
         "ok": _load_error is None,
         "model_loaded": _tts is not None,
         "load_error": _load_error,
+        "device": _device_used or _resolve_device(),
+        "backend": backend,
+        "engine_device": str(engine_device) if engine_device is not None else None,
         "output_dir": str(OUTPUT_DIR),
     }
 
