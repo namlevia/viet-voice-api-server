@@ -6,6 +6,13 @@ Run:
 uv run vieneu-api
 ```
 
+For preset voices only, `uv sync` is enough. For voice cloning from uploaded
+reference audio, install the extra runtime first:
+
+```bash
+uv sync --group gpu
+```
+
 Default URL: `http://127.0.0.1:8008`
 
 Environment variables:
@@ -78,7 +85,36 @@ curl -X POST http://127.0.0.1:8008/tts/file \
   -d '{
     "text": "Xin chào, đây là VieNeu TTS API.",
     "voice": "Trúc Ly"
-  }'
+}'
+```
+
+### `POST /tts/clone`
+
+Clones a voice from an uploaded reference audio file and returns `audio/wav`
+directly. This matches the Gradio v3 Voice Cloning flow: upload a short
+reference clip and synthesize with that voice. For v3 Turbo, no reference
+transcript is needed.
+
+```bash
+curl -X POST http://127.0.0.1:8008/tts/clone \
+  -F 'ref_audio=@examples/audio_ref/example.wav' \
+  -F 'text=[cười] Đây là giọng được clone từ audio mẫu.' \
+  -F 'style=tu_nhien' \
+  -F 'denoise=true' \
+  --output cloned.wav
+```
+
+### `POST /tts/clone/file`
+
+Clones a voice from an uploaded reference audio file and returns JSON with
+`audio_url`, `audio_path`, and `reference_audio_path`.
+
+```bash
+curl -X POST http://127.0.0.1:8008/tts/clone/file \
+  -F 'ref_audio=@examples/audio_ref/example.wav' \
+  -F 'text=Xin chào, đây là endpoint clone giọng.' \
+  -F 'temperature=0.8' \
+  -F 'max_chars=256'
 ```
 
 ## Request Parameters
@@ -95,6 +131,16 @@ curl -X POST http://127.0.0.1:8008/tts/file \
 - `denoise`: default `true`
 - `use_ref_codes`: default `true`
 - `apply_watermark`: default `true`
+
+For `/tts/clone` and `/tts/clone/file`, send the same parameters as multipart
+form fields. The `voice` field is ignored because `ref_audio` becomes the voice
+source.
+
+Clone-specific fields:
+
+- `ref_audio` required upload; use a clean `.wav` around 3-5 seconds when possible
+- `denoise`: default `true`; removes background noise and normalizes the reference
+- `text`: supports the same inline emotion tags as preset generation
 
 ## Voice Names
 

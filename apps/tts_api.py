@@ -7,7 +7,7 @@ from typing import Optional
 
 import numpy as np
 import soundfile as sf
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -95,10 +95,10 @@ def _voice_id(tts, voice: Optional[str]) -> Optional[str]:
     raise HTTPException(status_code=400, detail={"message": f"Voice '{voice}' not found.", "voices": available})
 
 
-def _synthesize(req: TTSRequest) -> tuple[np.ndarray, int, float, str]:
+def _synthesize(req: TTSRequest, ref_audio: Optional[Path] = None) -> tuple[np.ndarray, int, float, str]:
     tts = _get_tts()
     style = _normalize_style(req.style)
-    voice = _voice_id(tts, req.voice)
+    voice = None if ref_audio else _voice_id(tts, req.voice)
 
     start = time.time()
     # CPU/ONNX inference is not designed for concurrent mutation of model caches.
@@ -106,6 +106,7 @@ def _synthesize(req: TTSRequest) -> tuple[np.ndarray, int, float, str]:
         wav = tts.infer(
             text=req.text.strip(),
             voice=voice,
+            ref_audio=str(ref_audio) if ref_audio else None,
             style=style,
             denoise=req.denoise,
             use_ref_codes=req.use_ref_codes,
@@ -121,6 +122,46 @@ def _synthesize(req: TTSRequest) -> tuple[np.ndarray, int, float, str]:
     if wav is None or len(wav) == 0:
         raise HTTPException(status_code=500, detail="Model returned empty audio.")
     return np.asarray(wav, dtype=np.float32), int(getattr(tts, "sample_rate", 48000)), elapsed, style
+
+
+def _request_from_form(
+    text: str,
+    style: str,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    max_new_frames: int,
+    repetition_penalty: float,
+    max_chars: int,
+    denoise: bool,
+    use_ref_codes: bool,
+    apply_watermark: bool,
+) -> TTSRequest:
+    return TTSRequest(
+        text=text,
+        style=style,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        max_new_frames=max_new_frames,
+        repetition_penalty=repetition_penalty,
+        max_chars=max_chars,
+        denoise=denoise,
+        use_ref_codes=use_ref_codes,
+        apply_watermark=apply_watermark,
+    )
+
+
+def _save_upload(upload: UploadFile) -> Path:
+    suffix = Path(upload.filename or "reference.wav").suffix or ".wav"
+    path = OUTPUT_DIR / f"ref_{int(time.time() * 1000)}_{threading.get_ident()}{suffix}"
+    with path.open("wb") as out:
+        while True:
+            chunk = upload.file.read(1024 * 1024)
+            if not chunk:
+                break
+            out.write(chunk)
+    return path
 
 
 def _write_wav(wav: np.ndarray, sample_rate: int) -> Path:
@@ -178,6 +219,78 @@ def tts_file(req: TTSRequest):
             "duration_seconds": round(duration, 3),
             "elapsed_seconds": round(elapsed, 3),
             "style": style,
+        }
+    )
+
+
+@app.post("/tts/clone")
+def tts_clone_audio(
+    ref_audio: UploadFile = File(..., description="Reference voice audio, ideally 3-5 seconds."),
+    text: str = Form(...),
+    style: str = Form("tu_nhien"),
+    temperature: float = Form(0.8),
+    top_k: int = Form(25),
+    top_p: float = Form(0.95),
+    max_new_frames: int = Form(300),
+    repetition_penalty: float = Form(1.2),
+    max_chars: int = Form(256),
+    denoise: bool = Form(True),
+    use_ref_codes: bool = Form(True),
+    apply_watermark: bool = Form(True),
+):
+    req = _request_from_form(
+        text, style, temperature, top_k, top_p, max_new_frames,
+        repetition_penalty, max_chars, denoise, use_ref_codes, apply_watermark,
+    )
+    ref_path = _save_upload(ref_audio)
+    try:
+        wav, sample_rate, elapsed, style_key = _synthesize(req, ref_audio=ref_path)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Voice cloning failed: {exc}") from exc
+    path = _write_wav(wav, sample_rate)
+    headers = {
+        "X-Sample-Rate": str(sample_rate),
+        "X-Elapsed-Seconds": f"{elapsed:.3f}",
+        "X-Style": style_key,
+    }
+    return FileResponse(str(path), media_type="audio/wav", filename=path.name, headers=headers)
+
+
+@app.post("/tts/clone/file")
+def tts_clone_file(
+    ref_audio: UploadFile = File(..., description="Reference voice audio, ideally 3-5 seconds."),
+    text: str = Form(...),
+    style: str = Form("tu_nhien"),
+    temperature: float = Form(0.8),
+    top_k: int = Form(25),
+    top_p: float = Form(0.95),
+    max_new_frames: int = Form(300),
+    repetition_penalty: float = Form(1.2),
+    max_chars: int = Form(256),
+    denoise: bool = Form(True),
+    use_ref_codes: bool = Form(True),
+    apply_watermark: bool = Form(True),
+):
+    req = _request_from_form(
+        text, style, temperature, top_k, top_p, max_new_frames,
+        repetition_penalty, max_chars, denoise, use_ref_codes, apply_watermark,
+    )
+    ref_path = _save_upload(ref_audio)
+    try:
+        wav, sample_rate, elapsed, style_key = _synthesize(req, ref_audio=ref_path)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Voice cloning failed: {exc}") from exc
+    path = _write_wav(wav, sample_rate)
+    duration = len(wav) / sample_rate
+    return JSONResponse(
+        {
+            "audio_url": f"/audio/{path.name}",
+            "audio_path": str(path),
+            "reference_audio_path": str(ref_path),
+            "sample_rate": sample_rate,
+            "duration_seconds": round(duration, 3),
+            "elapsed_seconds": round(elapsed, 3),
+            "style": style_key,
         }
     )
 
