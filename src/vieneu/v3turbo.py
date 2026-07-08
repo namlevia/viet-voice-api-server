@@ -287,6 +287,7 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
         # both the PyTorch and ONNX engines expose infer_stream. Fall back to one
         # full infer per chunk if not available.
         stream_fn = getattr(self.engine, "infer_stream", None)
+        chunk_frames = int(kwargs.get("chunk_frames", 25) or 25)
         for chunk in chunks:
             ph = phonemize_text_with_emotions(chunk)
             if stream_fn is not None:
@@ -294,7 +295,8 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
                     phonemes=ph, speaker_emb=speaker_emb, ref_codes=ref_codes,
                     style=style, use_ref_codes=use_ref_codes,
                     temperature=temperature, top_k=top_k, top_p=top_p,
-                    max_new_frames=max_new_frames, repetition_penalty=repetition_penalty,
+                    max_new_frames=max_new_frames, chunk_frames=chunk_frames,
+                    repetition_penalty=repetition_penalty,
                 ):
                     if sub is None or len(sub) == 0:
                         continue

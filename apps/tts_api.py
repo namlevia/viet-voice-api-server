@@ -3,13 +3,15 @@ import sys
 import tempfile
 import threading
 import time
+from collections import OrderedDict
+from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -44,6 +46,8 @@ _device_used: Optional[str] = None
 _warmup_started = False
 _warmup_done = False
 _warmup_error: Optional[str] = None
+_xiaozhi_cache: OrderedDict[tuple, bytes] = OrderedDict()
+_xiaozhi_cache_lock = threading.Lock()
 
 
 class TTSRequest(BaseModel):
@@ -72,6 +76,12 @@ class XiaozhiTTSRequest(BaseModel):
     temperature: float = Field(0.8, ge=0.0, le=2.0)
     max_chars: int = Field(160, ge=32, le=512)
     apply_watermark: bool = True
+    denoise: bool = False
+    use_ref_codes: bool = True
+
+
+class XiaozhiStreamRequest(XiaozhiTTSRequest):
+    chunk_frames: int = Field(25, ge=1, le=100)
 
 
 def _normalize_style(style: str) -> str:
@@ -200,6 +210,20 @@ def _write_wav(wav: np.ndarray, sample_rate: int) -> Path:
     return path
 
 
+def _wav_bytes(wav: np.ndarray, sample_rate: int) -> bytes:
+    buf = BytesIO()
+    sf.write(buf, wav, sample_rate, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
+
+
+def _pcm16_bytes(wav: np.ndarray) -> bytes:
+    audio = np.asarray(wav, dtype=np.float32)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    audio = np.clip(audio, -1.0, 1.0)
+    return (audio * 32767.0).astype("<i2").tobytes()
+
+
 def _resample_wav(wav: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
     if target_rate not in (16000, 24000):
         raise HTTPException(status_code=400, detail="sample_rate must be 16000 or 24000")
@@ -217,16 +241,121 @@ def _xiaozhi_to_tts_request(req: XiaozhiTTSRequest) -> TTSRequest:
         temperature=req.temperature,
         max_chars=req.max_chars,
         apply_watermark=req.apply_watermark,
+        denoise=req.denoise,
+        use_ref_codes=req.use_ref_codes,
     )
+
+
+def _xiaozhi_cache_limit() -> int:
+    try:
+        return max(0, int(os.getenv("XIAOZHI_CACHE_SIZE", "64")))
+    except ValueError:
+        return 64
+
+
+def _xiaozhi_cache_key(req: XiaozhiTTSRequest) -> tuple:
+    return (
+        req.text.strip(),
+        req.voice or os.getenv("XIAOZHI_TTS_VOICE") or "",
+        _normalize_style(req.style),
+        req.sample_rate,
+        round(float(req.temperature), 4),
+        req.max_chars,
+        req.apply_watermark,
+        req.denoise,
+        req.use_ref_codes,
+    )
+
+
+def _xiaozhi_cache_get(key: tuple) -> Optional[bytes]:
+    if _xiaozhi_cache_limit() <= 0:
+        return None
+    with _xiaozhi_cache_lock:
+        data = _xiaozhi_cache.get(key)
+        if data is None:
+            return None
+        _xiaozhi_cache.move_to_end(key)
+        return data
+
+
+def _xiaozhi_cache_set(key: tuple, data: bytes) -> None:
+    limit = _xiaozhi_cache_limit()
+    if limit <= 0:
+        return
+    with _xiaozhi_cache_lock:
+        _xiaozhi_cache[key] = data
+        _xiaozhi_cache.move_to_end(key)
+        while len(_xiaozhi_cache) > limit:
+            _xiaozhi_cache.popitem(last=False)
+
+
+def _render_xiaozhi_wav(req: XiaozhiTTSRequest) -> tuple[bytes, float, str, int, int, bool]:
+    key = _xiaozhi_cache_key(req)
+    cached = _xiaozhi_cache_get(key)
+    if cached is not None:
+        return cached, 0.0, key[2], req.sample_rate, req.sample_rate, True
+
+    tts_req = _xiaozhi_to_tts_request(req)
+    wav, source_rate, elapsed, style = _synthesize(tts_req)
+    out_wav = _resample_wav(wav, source_rate, req.sample_rate)
+    data = _wav_bytes(out_wav, req.sample_rate)
+    _xiaozhi_cache_set(key, data)
+    return data, elapsed, style, source_rate, req.sample_rate, False
+
+
+def _stream_xiaozhi_pcm(req: XiaozhiStreamRequest):
+    tts = _get_tts()
+    style = _normalize_style(req.style)
+    voice = _voice_id(tts, req.voice or os.getenv("XIAOZHI_TTS_VOICE") or None)
+    source_rate = int(getattr(tts, "sample_rate", 48000))
+    stream_fn = getattr(tts, "infer_stream", None)
+    if stream_fn is None:
+        tts_req = _xiaozhi_to_tts_request(req)
+        wav, source_rate, _, _ = _synthesize(tts_req)
+        yield _pcm16_bytes(_resample_wav(wav, source_rate, req.sample_rate))
+        return
+
+    started = time.time()
+    first = True
+    with _infer_lock:
+        for chunk in stream_fn(
+            text=req.text.strip(),
+            voice=voice,
+            style=style,
+            denoise=req.denoise,
+            use_ref_codes=req.use_ref_codes,
+            temperature=req.temperature,
+            max_chars=req.max_chars,
+            apply_watermark=req.apply_watermark,
+            chunk_frames=req.chunk_frames,
+        ):
+            if chunk is None or len(chunk) == 0:
+                continue
+            out = _resample_wav(np.asarray(chunk, dtype=np.float32), source_rate, req.sample_rate)
+            data = _pcm16_bytes(out)
+            if not data:
+                continue
+            if first:
+                first = False
+                print(f"⚡ Xiaozhi stream first audio in {time.time() - started:.3f}s")
+            yield data
 
 
 def _warmup_once() -> None:
     global _warmup_done, _warmup_error
     try:
-        text = os.getenv("XIAOZHI_WARMUP_TEXT", "Xin chào.")
+        texts = os.getenv("XIAOZHI_WARMUP_TEXTS") or os.getenv("XIAOZHI_WARMUP_TEXT") or "Xin chào.|Kiểm tra cấu hình"
         voice = os.getenv("XIAOZHI_TTS_VOICE") or None
-        req = TTSRequest(text=text, voice=voice, max_chars=64, apply_watermark=False)
-        _synthesize(req)
+        for text in [part.strip() for part in texts.split("|") if part.strip()]:
+            req = XiaozhiTTSRequest(
+                text=text,
+                voice=voice,
+                sample_rate=int(os.getenv("XIAOZHI_WARMUP_SAMPLE_RATE", "16000")),
+                max_chars=64,
+                apply_watermark=False,
+                denoise=False,
+            )
+            _render_xiaozhi_wav(req)
         _warmup_done = True
         _warmup_error = None
         print("✅ Xiaozhi TTS warm-up completed.")
@@ -261,6 +390,7 @@ def health():
         "warmup_done": _warmup_done,
         "warmup_error": _warmup_error,
         "output_dir": str(OUTPUT_DIR),
+        "xiaozhi_cache_size": len(_xiaozhi_cache),
     }
 
 
@@ -285,17 +415,32 @@ def xiaozhi_health():
 
 @app.post("/xiaozhi/tts")
 def xiaozhi_tts(req: XiaozhiTTSRequest):
-    tts_req = _xiaozhi_to_tts_request(req)
-    wav, source_rate, elapsed, style = _synthesize(tts_req)
-    out_wav = _resample_wav(wav, source_rate, req.sample_rate)
-    path = _write_wav(out_wav, req.sample_rate)
+    data, elapsed, style, source_rate, output_rate, cache_hit = _render_xiaozhi_wav(req)
     headers = {
-        "X-Sample-Rate": str(req.sample_rate),
+        "X-Sample-Rate": str(output_rate),
         "X-Source-Sample-Rate": str(source_rate),
         "X-Elapsed-Seconds": f"{elapsed:.3f}",
         "X-Style": style,
+        "X-Cache": "HIT" if cache_hit else "MISS",
     }
-    return FileResponse(str(path), media_type="audio/wav", filename=path.name, headers=headers)
+    return Response(content=data, media_type="audio/wav", headers=headers)
+
+
+@app.post("/xiaozhi/tts/stream")
+def xiaozhi_tts_stream(req: XiaozhiStreamRequest):
+    if req.sample_rate not in (16000, 24000):
+        raise HTTPException(status_code=400, detail="sample_rate must be 16000 or 24000")
+    headers = {
+        "X-Sample-Rate": str(req.sample_rate),
+        "X-Source-Sample-Rate": str(getattr(_get_tts(), "sample_rate", 48000)),
+        "X-Audio-Format": "pcm_s16le",
+        "X-Streaming": "true",
+    }
+    return StreamingResponse(
+        _stream_xiaozhi_pcm(req),
+        media_type="audio/pcm",
+        headers=headers,
+    )
 
 
 @app.post("/tts")

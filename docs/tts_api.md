@@ -24,7 +24,10 @@ Environment variables:
   machines, otherwise `cpu`
 - `VIENEU_OUTPUT_DIR`: output parent directory for generated audio files
 - `XIAOZHI_WARMUP`: enable/disable Xiaozhi warm-up on startup, default `true`
-- `XIAOZHI_WARMUP_TEXT`: warm-up text, default `Xin chào.`
+- `XIAOZHI_WARMUP_TEXTS`: warm-up texts separated by `|`, default
+  `Xin chào.|Kiểm tra cấu hình`
+- `XIAOZHI_CACHE_SIZE`: in-memory WAV cache size for `/xiaozhi/tts`, default `64`.
+  Set `0` to disable cache.
 - `XIAOZHI_TTS_VOICE`: default voice for `/xiaozhi/tts` and warm-up
 
 ## Endpoints
@@ -65,8 +68,8 @@ Response shape:
 
 ### `GET /xiaozhi/health`
 
-Returns the same model/device status as `/health`, plus warm-up fields:
-`warmup_started`, `warmup_done`, and `warmup_error`.
+Returns the same model/device status as `/health`, plus warm-up/cache fields:
+`warmup_started`, `warmup_done`, `warmup_error`, and `xiaozhi_cache_size`.
 
 ### `POST /xiaozhi/tts`
 
@@ -77,6 +80,10 @@ ESP32-friendly playback.
 The server starts a short background warm-up automatically when `uv run
 vieneu-api` starts, so the first real Xiaozhi request avoids most model/MPS
 startup cost.
+
+The endpoint also keeps a small in-memory WAV cache. Repeating the same
+`text` + voice + style + generation parameters returns immediately with the
+response header `X-Cache: HIT`.
 
 ```bash
 curl -X POST http://127.0.0.1:1238/xiaozhi/tts \
@@ -98,7 +105,47 @@ Request fields:
 - `style`: `tu_nhien`, `tin_tuc`, or `doc_truyen`
 - `temperature`: default `0.8`
 - `max_chars`: default `160`
+- `denoise`: default `false` for `/xiaozhi/tts`
+- `use_ref_codes`: default `true`
 - `apply_watermark`: default `true`
+
+Useful response headers:
+
+- `X-Cache`: `HIT` or `MISS`
+- `X-Elapsed-Seconds`: synth/resample time measured inside the API
+- `X-Sample-Rate`: final WAV sample rate
+
+### `POST /xiaozhi/tts/stream`
+
+Xiaozhi streaming endpoint. It uses VieNeu v3 Turbo `infer_stream` and returns
+raw mono PCM chunks (`audio/pcm`, signed 16-bit little-endian) at `16000` or
+`24000` Hz. This endpoint is intended for the Xiaozhi Go server, which converts
+the incoming PCM stream to Opus frames as soon as audio arrives.
+
+```bash
+curl -X POST http://127.0.0.1:1238/xiaozhi/tts/stream \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "text": "Xin chào, đây là streaming thật của VieNeu.",
+    "voice": "Phạm Tuyên",
+    "sample_rate": 16000,
+    "style": "tu_nhien",
+    "chunk_frames": 8,
+    "apply_watermark": false
+  }' \
+  --output xiaozhi.pcm
+```
+
+Extra request field:
+
+- `chunk_frames`: default `25`; lower values reduce first-audio latency, higher
+  values are smoother and lighter.
+
+Useful response headers:
+
+- `X-Streaming: true`
+- `X-Audio-Format: pcm_s16le`
+- `X-Sample-Rate`: output PCM sample rate
 
 ### `POST /tts`
 
