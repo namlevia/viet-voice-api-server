@@ -23,6 +23,9 @@ Environment variables:
   `Auto` behavior: `mps` on Apple Silicon when available, `cuda` on CUDA
   machines, otherwise `cpu`
 - `VIENEU_OUTPUT_DIR`: output parent directory for generated audio files
+- `XIAOZHI_WARMUP`: enable/disable Xiaozhi warm-up on startup, default `true`
+- `XIAOZHI_WARMUP_TEXT`: warm-up text, default `Xin chào.`
+- `XIAOZHI_TTS_VOICE`: default voice for `/xiaozhi/tts` and warm-up
 
 ## Endpoints
 
@@ -59,6 +62,43 @@ Response shape:
   ]
 }
 ```
+
+### `GET /xiaozhi/health`
+
+Returns the same model/device status as `/health`, plus warm-up fields:
+`warmup_started`, `warmup_done`, and `warmup_error`.
+
+### `POST /xiaozhi/tts`
+
+Xiaozhi-optimized endpoint. It synthesizes with VieNeu at 48 kHz, then returns
+a mono WAV resampled to `16000` or `24000` Hz. Default output is `16000` Hz for
+ESP32-friendly playback.
+
+The server starts a short background warm-up automatically when `uv run
+vieneu-api` starts, so the first real Xiaozhi request avoids most model/MPS
+startup cost.
+
+```bash
+curl -X POST http://127.0.0.1:1238/xiaozhi/tts \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "text": "Xin chào, đây là giọng nói dành cho Xiaozhi.",
+    "voice": "Phạm Tuyên",
+    "sample_rate": 16000,
+    "style": "tu_nhien"
+  }' \
+  --output xiaozhi.wav
+```
+
+Request fields:
+
+- `text` required
+- `voice` optional; falls back to `XIAOZHI_TTS_VOICE`, then model default
+- `sample_rate`: `16000` or `24000`, default `16000`
+- `style`: `tu_nhien`, `tin_tuc`, or `doc_truyen`
+- `temperature`: default `0.8`
+- `max_chars`: default `160`
+- `apply_watermark`: default `true`
 
 ### `POST /tts`
 

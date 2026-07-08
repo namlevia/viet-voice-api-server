@@ -41,6 +41,9 @@ _tts_lock = threading.Lock()
 _infer_lock = threading.Lock()
 _load_error: Optional[str] = None
 _device_used: Optional[str] = None
+_warmup_started = False
+_warmup_done = False
+_warmup_error: Optional[str] = None
 
 
 class TTSRequest(BaseModel):
@@ -58,6 +61,16 @@ class TTSRequest(BaseModel):
     max_chars: int = Field(256, ge=32, le=2048)
     denoise: bool = True
     use_ref_codes: bool = True
+    apply_watermark: bool = True
+
+
+class XiaozhiTTSRequest(BaseModel):
+    text: str = Field(..., min_length=1, description="Text to synthesize for Xiaozhi.")
+    voice: Optional[str] = Field(None, description="Preset voice id or display label.")
+    style: str = "tu_nhien"
+    sample_rate: int = Field(16000, description="Output WAV sample rate: 16000 or 24000.")
+    temperature: float = Field(0.8, ge=0.0, le=2.0)
+    max_chars: int = Field(160, ge=32, le=512)
     apply_watermark: bool = True
 
 
@@ -187,6 +200,52 @@ def _write_wav(wav: np.ndarray, sample_rate: int) -> Path:
     return path
 
 
+def _resample_wav(wav: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
+    if target_rate not in (16000, 24000):
+        raise HTTPException(status_code=400, detail="sample_rate must be 16000 or 24000")
+    if source_rate == target_rate:
+        return np.asarray(wav, dtype=np.float32)
+    import soxr
+    return np.asarray(soxr.resample(wav, source_rate, target_rate), dtype=np.float32)
+
+
+def _xiaozhi_to_tts_request(req: XiaozhiTTSRequest) -> TTSRequest:
+    return TTSRequest(
+        text=req.text,
+        voice=req.voice or os.getenv("XIAOZHI_TTS_VOICE") or None,
+        style=req.style,
+        temperature=req.temperature,
+        max_chars=req.max_chars,
+        apply_watermark=req.apply_watermark,
+    )
+
+
+def _warmup_once() -> None:
+    global _warmup_done, _warmup_error
+    try:
+        text = os.getenv("XIAOZHI_WARMUP_TEXT", "Xin chào.")
+        voice = os.getenv("XIAOZHI_TTS_VOICE") or None
+        req = TTSRequest(text=text, voice=voice, max_chars=64, apply_watermark=False)
+        _synthesize(req)
+        _warmup_done = True
+        _warmup_error = None
+        print("✅ Xiaozhi TTS warm-up completed.")
+    except Exception as exc:
+        _warmup_error = str(exc)
+        print(f"⚠️ Xiaozhi TTS warm-up failed: {exc}")
+
+
+@app.on_event("startup")
+def start_warmup() -> None:
+    global _warmup_started
+    if os.getenv("XIAOZHI_WARMUP", "true").lower() in ("0", "false", "no", "off"):
+        return
+    if _warmup_started:
+        return
+    _warmup_started = True
+    threading.Thread(target=_warmup_once, name="xiaozhi-tts-warmup", daemon=True).start()
+
+
 @app.get("/health")
 def health():
     backend = getattr(_tts, "backend", None) if _tts is not None else None
@@ -198,6 +257,9 @@ def health():
         "device": _device_used or _resolve_device(),
         "backend": backend,
         "engine_device": str(engine_device) if engine_device is not None else None,
+        "warmup_started": _warmup_started,
+        "warmup_done": _warmup_done,
+        "warmup_error": _warmup_error,
         "output_dir": str(OUTPUT_DIR),
     }
 
@@ -214,6 +276,26 @@ def voices():
             {"label": "Kể chuyện", "id": "doc_truyen"},
         ],
     }
+
+
+@app.get("/xiaozhi/health")
+def xiaozhi_health():
+    return health()
+
+
+@app.post("/xiaozhi/tts")
+def xiaozhi_tts(req: XiaozhiTTSRequest):
+    tts_req = _xiaozhi_to_tts_request(req)
+    wav, source_rate, elapsed, style = _synthesize(tts_req)
+    out_wav = _resample_wav(wav, source_rate, req.sample_rate)
+    path = _write_wav(out_wav, req.sample_rate)
+    headers = {
+        "X-Sample-Rate": str(req.sample_rate),
+        "X-Source-Sample-Rate": str(source_rate),
+        "X-Elapsed-Seconds": f"{elapsed:.3f}",
+        "X-Style": style,
+    }
+    return FileResponse(str(path), media_type="audio/wav", filename=path.name, headers=headers)
 
 
 @app.post("/tts")
