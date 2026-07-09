@@ -75,7 +75,7 @@ class OnnxV3LiteEngine:
     ):
         import onnxruntime as ort
 
-        self._lock = threading.RLock()
+        self._lock = threading.Lock()
         self.device = _Dev()
         self.checkpoint_path = checkpoint_path
         repo = onnx_repo or checkpoint_path

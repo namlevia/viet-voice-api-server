@@ -58,11 +58,13 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
             # model repo (uploaded separately).
             from ._v3_turbo_engine.onnx_runtime_lite import OnnxV3LiteEngine
             logger.info(f"⏳ Loading VieNeu-TTS v3 Turbo (ONNX/CPU) from: {backbone_repo}/{onnx_subfolder} ...")
+            threads = kwargs.get("threads", 0)
             self.engine = OnnxV3LiteEngine(
                 checkpoint_path=backbone_repo,
                 onnx_repo=onnx_repo,
                 onnx_dir=onnx_dir,
                 onnx_subfolder=onnx_subfolder,
+                threads=threads,
             )
             self.backend = "onnx"
         else:
